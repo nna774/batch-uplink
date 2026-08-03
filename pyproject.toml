@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "batch-uplink"
+version = "1.0.0"
+description = "測って貯めて送る基盤のクラウド側。HMAC検証・デバイス生存台帳・通知・S3キー組み立て。"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [{ name = "久我山菜々" }]
+# boto3 は Lambda 実行環境に同梱されているので依存に書かない。
+# ここに足すと build_lambda.sh の zip が無駄に太る（--no-deps で入れる前提）。
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/nna774/batch-uplink"
+
+[tool.setuptools]
+packages = ["batch_uplink"]

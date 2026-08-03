@@ -1,0 +1,16 @@
+{
+  "name": "batch-uplink",
+  "version": "1.0.0",
+  "description": "測って貯めて送る基盤。固定長レコードのバッチ・HMAC署名付きPOST・LittleFS退避とバックフィル・NTP同期。ワイヤ形式には依存しない。",
+  "keywords": ["batch", "uplink", "hmac", "littlefs", "ntp", "esp32"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nna774/batch-uplink.git"
+  },
+  "authors": [{ "name": "久我山菜々", "url": "https://github.com/nna774" }],
+  "license": "MIT",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "headers": ["Batch.h", "Uploader.h", "TimeSync.h"],
+  "export": { "include": ["src", "library.json", "LICENSE", "README.md"] }
+}
