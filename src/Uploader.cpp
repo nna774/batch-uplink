@@ -172,6 +172,15 @@ bool Uploader::spillOldestRam() {
   return true;
 }
 
+size_t Uploader::flushToSpill() {
+  size_t n = 0;
+  while (!ram_.empty()) {
+    if (!spillOldestRam()) break;
+    ++n;
+  }
+  return n;
+}
+
 bool Uploader::oldestQueuedStartUs(uint64_t& outStartUs) const {
   if (spillCount_ > 0) {
     char path[64];
