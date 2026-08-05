@@ -9,6 +9,8 @@
 // 捨てて新しいデータを残す。既定は false でこの例外は発動しない
 // （呼び出し側が明示的に選ばない限り不変条件は変わらない）。
 
+#include <Arduino.h>
+
 #include <deque>
 #include <cstdint>
 
@@ -16,9 +18,14 @@
 
 class Uploader {
  public:
+  // watchResponseHeader: 設定すると、バッチPOSTが成功した時にそのレスポンス
+  // ヘッダの値を保持し lastResponseHeaderValue() で読めるようになる（オプトイン、
+  // 既定nullptrで従来通りヘッダを一切見ない）。この層はヘッダを読んで渡すだけで
+  // 意味づけは持たない——「何のヘッダか・値をどう解釈するか」は呼び出し側の責務。
+  // Electabuzz等の他プロジェクトを巻き込まないための設計（dropOldestWhenFullと同じ考え方）。
   Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
            uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
-           bool dropOldestWhenFull = false);
+           bool dropOldestWhenFull = false, const char* watchResponseHeader = nullptr);
 
   // 起動時に LittleFS をマウントし退避ファイル数を数える。
   bool begin();
@@ -48,6 +55,11 @@ class Uploader {
   // 既定(false)では常に0のまま（捨てないので増えようがない）。
   size_t droppedCount() const { return droppedCount_; }
 
+  // watchResponseHeader が設定されている時、直近成功したバッチPOSTのレスポンスに
+  // そのヘッダがあればその値、無ければ空文字列。watchResponseHeader==nullptrなら
+  // 常に空文字列。POSTが失敗した回は更新しない（前回成功時の値を保持）。
+  String lastResponseHeaderValue() const { return lastResponseHeaderValue_; }
+
  private:
   bool postBatch(const uint8_t* body, size_t len);
   bool spillOldestRam();               // RAM先頭をファイルへ
@@ -62,10 +74,12 @@ class Uploader {
   uint32_t maxRam_;
   const char* spillDir_;
   bool dropOldestWhenFull_;
+  const char* watchResponseHeader_;
 
   std::deque<Batch*> ram_;
   size_t spillCount_ = 0;
   size_t droppedCount_ = 0;
+  String lastResponseHeaderValue_;
   uint32_t backoffMs_ = 0;
   uint32_t nextAttemptMs_ = 0;
 };
