@@ -55,6 +55,13 @@ class Uploader {
   // 既定(false)では常に0のまま（捨てないので増えようがない）。
   size_t droppedCount() const { return droppedCount_; }
 
+  // RAMキューにある分を全てLittleFSへ退避する。戻り値は退避できた本数。
+  // OTA更新など「この後の処理でRAMの内容が失われうる」場面で、再起動前に
+  // 呼び出し側が明示的に呼ぶことを想定（enqueue()はRAMが一杯になった時しか
+  // 自発的に退避しないため、それ未満で溜まっている分は対象にならない）。
+  // 書き込みが途中で失敗したら、そこで止めて残りはRAMに置いたまま返す。
+  size_t flushToSpill();
+
   // watchResponseHeader が設定されている時、直近成功したバッチPOSTのレスポンスに
   // そのヘッダがあればその値、無ければ空文字列。watchResponseHeader==nullptrなら
   // 常に空文字列。POSTが失敗した回は更新しない（前回成功時の値を保持）。
