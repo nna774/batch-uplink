@@ -15,10 +15,10 @@ static constexpr uint32_t kBackoffMaxMs = 60000;
 
 Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
                    uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
-                   bool dropOldestWhenFull)
+                   bool dropOldestWhenFull, const char* watchResponseHeader)
     : ingestUrl_(ingestUrl), alertUrl_(alertUrl), hmacSecret_(hmacSecret),
       deviceId_(deviceId), maxRam_(maxRamBatches), spillDir_(spillDir),
-      dropOldestWhenFull_(dropOldestWhenFull) {}
+      dropOldestWhenFull_(dropOldestWhenFull), watchResponseHeader_(watchResponseHeader) {}
 
 bool Uploader::begin() {
   if (!LittleFS.begin(true)) {
@@ -114,12 +114,19 @@ bool Uploader::postBatch(const uint8_t* body, size_t len) {
   client.setInsecure();  // TODO: Function URL のルート証明書をピン留めする
   HTTPClient http;
   if (!http.begin(client, ingestUrl_)) return false;
+  if (watchResponseHeader_) {
+    const char* headers[] = {watchResponseHeader_};
+    http.collectHeaders(headers, 1);
+  }
   http.addHeader("Content-Type", "application/octet-stream");
   http.addHeader("X-Namz-Device", String(deviceId_));
   http.addHeader("X-Namz-Signature", hmacSha256Hex(hmacSecret_, body, len).c_str());
   int code = http.POST(const_cast<uint8_t*>(body), len);
-  http.end();
   bool ok = (code >= 200 && code < 300);
+  if (ok && watchResponseHeader_) {
+    lastResponseHeaderValue_ = http.header(watchResponseHeader_);
+  }
+  http.end();
   if (!ok) {
     // TLSハンドシェイクは大きな連続ブロックを要求するので、空きの総量より
     // 「取れる最大ブロック」が効く。code=-1 が続く時はここを見る。

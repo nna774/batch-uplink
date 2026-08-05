@@ -12,6 +12,10 @@ last_batch_start_us との差でデータ遅延を、別々に見る。
 欠測通知の状態(offline_notified_at_us)とデータ遅延通知の状態(lag_notified_at_us)は
 watchdog だけが書く。ingest が書く受信系フィールドとは互いに素なので、両者を
 UpdateItem で分けて更新すれば read-modify-write の競合は起きない。
+
+再起動要求(pending_restart_requested_at_us)は手元CLIが書き、ingest が次回バッチ
+受信時に読んでレスポンスへ反映した直後に消す一回性のフィールド。これも受信系
+フィールドとは互いに素。
 """
 
 from __future__ import annotations
@@ -85,6 +89,26 @@ def clear_offline(device_id: int) -> None:
     _table().update_item(
         Key={"device_id": device_id},
         UpdateExpression="REMOVE offline_notified_at_us",
+    )
+
+
+def request_restart(device_id: int, at_us: int) -> None:
+    """再起動要求を立てる（手元CLI専用）。ingest が次回バッチ受信時に読んで
+    レスポンスへ反映し、反映した直後に clear_restart_request() で消す想定
+    （一度伝えたら消える一回性の要求）。
+    """
+    _table().update_item(
+        Key={"device_id": device_id},
+        UpdateExpression="SET pending_restart_requested_at_us = :t",
+        ExpressionAttributeValues={":t": _dec(at_us)},
+    )
+
+
+def clear_restart_request(device_id: int) -> None:
+    """再起動要求を消す（ingest がレスポンスへ反映した直後に呼ぶ）。"""
+    _table().update_item(
+        Key={"device_id": device_id},
+        UpdateExpression="REMOVE pending_restart_requested_at_us",
     )
 
 
