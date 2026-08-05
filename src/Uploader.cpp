@@ -165,7 +165,19 @@ bool Uploader::spillOldestRam() {
   return true;
 }
 
-bool Uploader::loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs) {
+bool Uploader::oldestQueuedStartUs(uint64_t& outStartUs) const {
+  if (spillCount_ > 0) {
+    char path[64];
+    return loadOldestSpillPath(path, sizeof(path), outStartUs);
+  }
+  if (!ram_.empty()) {
+    outStartUs = ram_.front()->startUs();
+    return true;
+  }
+  return false;
+}
+
+bool Uploader::loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs) const {
   File dir = LittleFS.open(spillDir_);
   String oldest;
   for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
