@@ -14,9 +14,11 @@ static constexpr uint32_t kBackoffStartMs = 1000;
 static constexpr uint32_t kBackoffMaxMs = 60000;
 
 Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
-                   uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir)
+                   uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
+                   bool dropOldestWhenFull)
     : ingestUrl_(ingestUrl), alertUrl_(alertUrl), hmacSecret_(hmacSecret),
-      deviceId_(deviceId), maxRam_(maxRamBatches), spillDir_(spillDir) {}
+      deviceId_(deviceId), maxRam_(maxRamBatches), spillDir_(spillDir),
+      dropOldestWhenFull_(dropOldestWhenFull) {}
 
 bool Uploader::begin() {
   if (!LittleFS.begin(true)) {
@@ -40,7 +42,16 @@ void Uploader::enqueue(Batch* batch) {
     return;
   }
   while (ram_.size() >= maxRam_) {
-    if (!spillOldestRam()) break;  // 退避できなければ諦めて積む（メモリ許す範囲）
+    if (spillOldestRam()) continue;
+    if (!dropOldestWhenFull_) break;  // 従来通り: 諦めて積む（メモリ許す範囲）
+    // LittleFSも一杯: 退避済みの最古を1本消して空きを作り、退避を再試行する。
+    // 退避ファイルが無ければ(=RAMキューの先頭が一番古い)、その先頭を諦める。
+    if (evictOldestSpill()) continue;
+    Batch* oldest = ram_.front();
+    ram_.pop_front();
+    delete oldest;
+    ++droppedCount_;
+    Serial.println("[uploader] spill full: dropped oldest queued batch");
   }
   ram_.push_back(batch);
 }
@@ -170,4 +181,13 @@ bool Uploader::loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs) 
 
 void Uploader::removeSpill(const char* path) {
   if (LittleFS.remove(path) && spillCount_ > 0) --spillCount_;
+}
+
+bool Uploader::evictOldestSpill() {
+  char path[64];
+  uint64_t startUs;
+  if (!loadOldestSpillPath(path, sizeof(path), startUs)) return false;
+  removeSpill(path);
+  ++droppedCount_;
+  return true;
 }
