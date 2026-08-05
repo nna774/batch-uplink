@@ -39,6 +39,11 @@ class Uploader {
   size_t ramQueued() const { return ram_.size(); }
   size_t spillCount() const { return spillCount_; }
 
+  // キュー中で最も古いバッチの開始時刻[us]（送信順序と同じ基準：退避ファイル優先、
+  // 無ければRAMキューの先頭）。キューが空なら false。表示で「どれだけ遅れているか」
+  // を出す用途を想定（呼び出し側が現在時刻との差を取る）。
+  bool oldestQueuedStartUs(uint64_t& outStartUs) const;
+
   // dropOldestWhenFull=true の時、満杯で捨てた本数の累計。
   // 既定(false)では常に0のまま（捨てないので増えようがない）。
   size_t droppedCount() const { return droppedCount_; }
@@ -46,7 +51,7 @@ class Uploader {
  private:
   bool postBatch(const uint8_t* body, size_t len);
   bool spillOldestRam();               // RAM先頭をファイルへ
-  bool loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs);
+  bool loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs) const;
   void removeSpill(const char* path);
   bool evictOldestSpill();             // 退避ファイルの最古を1本消す（空きを作る）
 

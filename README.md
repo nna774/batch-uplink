@@ -17,7 +17,7 @@
 | | |
 |---|---|
 | `Batch` | 送信バッファ。`[ヘッダ領域][固定長レコード × N][tail]` の3領域だけを知る |
-| `Uploader` | 送信キュー・LittleFS退避・指数バックオフ・バックフィル・HMAC署名POST。既定は退避先も一杯なら諦めて積む（データを捨てない）が、`dropOldestWhenFull=true` を渡すと満杯時に最古から捨てる |
+| `Uploader` | 送信キュー・LittleFS退避・指数バックオフ・バックフィル・HMAC署名POST。既定は退避先も一杯なら諦めて積む（データを捨てない）が、`dropOldestWhenFull=true` を渡すと満杯時に最古から捨てる。`oldestQueuedStartUs()` で最古の未送信バッチの開始時刻が取れる（呼び出し側で現在時刻と比べれば遅延表示に使える） |
 | `HmacSha256` | 署名。ボディのバイト列にしか依存しない |
 | `TimeSync` | NTP(smooth同期。大きなずれは一度だけstep) |
 
