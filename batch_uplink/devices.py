@@ -40,7 +40,7 @@ def _dec(v) -> Decimal:
 
 
 def record_batch(device_id: int, batch_start_us: int, ingest_at_us: int,
-                 last_batch_key: str = "") -> None:
+                 last_batch_key: str = "", fw_version: str = "") -> None:
     """バッチ受信を台帳に反映（upsert）。ingest から毎バッチ呼ぶ。
 
     - last_ingest_at_us  : 受信壁時計。生存の主信号。常に前進（値は常に "今"）。
@@ -48,19 +48,28 @@ def record_batch(device_id: int, batch_start_us: int, ingest_at_us: int,
       通常は順送りなので単調増加。バックフィル中は一時的に巻き戻り得るが、
       これは表示上の「データ鮮度」であって生存判定には使わないので許容する。
     - batches_total      : 累積受信数。
+    - fw_version         : 呼び出し側がリクエストヘッダ等から読んだ、送信元が
+      いま動かしているビルド版数（空文字なら書かない。ヘッダを送らない
+      呼び出し側や未対応の旧ファームとの互換のため）。
     """
+    set_parts = [
+        "last_ingest_at_us = :now",
+        "last_batch_start_us = :bs",
+        "last_batch_key = :key",
+    ]
+    values = {
+        ":now": _dec(ingest_at_us),
+        ":bs": _dec(batch_start_us),
+        ":key": last_batch_key,
+        ":one": Decimal(1),
+    }
+    if fw_version:
+        set_parts.append("fw_version = :fw")
+        values[":fw"] = fw_version
     _table().update_item(
         Key={"device_id": device_id},
-        UpdateExpression=(
-            "SET last_ingest_at_us = :now, last_batch_start_us = :bs, "
-            "last_batch_key = :key ADD batches_total :one"
-        ),
-        ExpressionAttributeValues={
-            ":now": _dec(ingest_at_us),
-            ":bs": _dec(batch_start_us),
-            ":key": last_batch_key,
-            ":one": Decimal(1),
-        },
+        UpdateExpression="SET " + ", ".join(set_parts) + " ADD batches_total :one",
+        ExpressionAttributeValues=values,
     )
 
 

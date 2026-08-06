@@ -16,12 +16,19 @@ static constexpr uint32_t kBackoffMaxMs = 60000;
 Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
                    uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
                    bool dropOldestWhenFull, const char* const* watchResponseHeaders,
-                   size_t watchResponseHeaderCount)
+                   size_t watchResponseHeaderCount,
+                   const char* const* extraRequestHeaderNames,
+                   const char* const* extraRequestHeaderValues,
+                   size_t extraRequestHeaderCount)
     : ingestUrl_(ingestUrl), alertUrl_(alertUrl), hmacSecret_(hmacSecret),
       deviceId_(deviceId), maxRam_(maxRamBatches), spillDir_(spillDir),
       dropOldestWhenFull_(dropOldestWhenFull), watchResponseHeaders_(watchResponseHeaders),
       watchResponseHeaderCount_(
-          watchResponseHeaders ? min(watchResponseHeaderCount, kMaxWatchedHeaders) : 0) {}
+          watchResponseHeaders ? min(watchResponseHeaderCount, kMaxWatchedHeaders) : 0),
+      extraRequestHeaderNames_(extraRequestHeaderNames),
+      extraRequestHeaderValues_(extraRequestHeaderValues),
+      extraRequestHeaderCount_(
+          extraRequestHeaderNames ? min(extraRequestHeaderCount, kMaxExtraRequestHeaders) : 0) {}
 
 bool Uploader::begin() {
   if (!LittleFS.begin(true)) {
@@ -126,6 +133,9 @@ bool Uploader::postBatch(const uint8_t* body, size_t len) {
   http.addHeader("Content-Type", "application/octet-stream");
   http.addHeader("X-Namz-Device", String(deviceId_));
   http.addHeader("X-Namz-Signature", hmacSha256Hex(hmacSecret_, body, len).c_str());
+  for (size_t i = 0; i < extraRequestHeaderCount_; ++i) {
+    http.addHeader(extraRequestHeaderNames_[i], extraRequestHeaderValues_[i]);
+  }
   int code = http.POST(const_cast<uint8_t*>(body), len);
   bool ok = (code >= 200 && code < 300);
   if (ok) {

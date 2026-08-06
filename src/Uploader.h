@@ -29,11 +29,24 @@ class Uploader {
   // kMaxWatchedHeadersを超える分は無視する。
   static constexpr size_t kMaxWatchedHeaders = 4;
 
+  // extraRequestHeaderNames/Values/Count: 設定すると、バッチPOSTのたびにそれらの
+  // ヘッダをリクエストへ付ける（オプトイン、既定nullptr/0で従来通り追加しない）。
+  // watchResponseHeadersと対称の設計——ここも「決まった名前・値のヘッダを
+  // 送るだけ」の汎用APIで、何を送るかの意味づけは呼び出し側の責務。
+  // namesとvaluesは同じ長さの配列で、names[i]の値がvalues[i]。値を毎回
+  // 変えたい場合は呼び出し側がvalues配列の指す先を書き換えればよい
+  // （Uploaderはコピーせずポインタを保持する。呼び出し側は静的な配列を渡すこと）。
+  // kMaxExtraRequestHeadersを超える分は無視する。
+  static constexpr size_t kMaxExtraRequestHeaders = 4;
+
   Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
            uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
            bool dropOldestWhenFull = false,
            const char* const* watchResponseHeaders = nullptr,
-           size_t watchResponseHeaderCount = 0);
+           size_t watchResponseHeaderCount = 0,
+           const char* const* extraRequestHeaderNames = nullptr,
+           const char* const* extraRequestHeaderValues = nullptr,
+           size_t extraRequestHeaderCount = 0);
 
   // 起動時に LittleFS をマウントし退避ファイル数を数える。
   bool begin();
@@ -91,6 +104,9 @@ class Uploader {
   bool dropOldestWhenFull_;
   const char* const* watchResponseHeaders_;
   size_t watchResponseHeaderCount_;
+  const char* const* extraRequestHeaderNames_;
+  const char* const* extraRequestHeaderValues_;
+  size_t extraRequestHeaderCount_;
 
   std::deque<Batch*> ram_;
   size_t spillCount_ = 0;
