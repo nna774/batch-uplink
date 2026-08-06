@@ -15,10 +15,13 @@ static constexpr uint32_t kBackoffMaxMs = 60000;
 
 Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
                    uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
-                   bool dropOldestWhenFull, const char* watchResponseHeader)
+                   bool dropOldestWhenFull, const char* const* watchResponseHeaders,
+                   size_t watchResponseHeaderCount)
     : ingestUrl_(ingestUrl), alertUrl_(alertUrl), hmacSecret_(hmacSecret),
       deviceId_(deviceId), maxRam_(maxRamBatches), spillDir_(spillDir),
-      dropOldestWhenFull_(dropOldestWhenFull), watchResponseHeader_(watchResponseHeader) {}
+      dropOldestWhenFull_(dropOldestWhenFull), watchResponseHeaders_(watchResponseHeaders),
+      watchResponseHeaderCount_(
+          watchResponseHeaders ? min(watchResponseHeaderCount, kMaxWatchedHeaders) : 0) {}
 
 bool Uploader::begin() {
   if (!LittleFS.begin(true)) {
@@ -114,17 +117,21 @@ bool Uploader::postBatch(const uint8_t* body, size_t len) {
   client.setInsecure();  // TODO: Function URL のルート証明書をピン留めする
   HTTPClient http;
   if (!http.begin(client, ingestUrl_)) return false;
-  if (watchResponseHeader_) {
-    const char* headers[] = {watchResponseHeader_};
-    http.collectHeaders(headers, 1);
+  if (watchResponseHeaderCount_ > 0) {
+    // HTTPClient::collectHeaders は const-correct でない(const char* headerKeys[])。
+    // 中身を書き換えないことは分かっているのでconst_castで橋渡しする。
+    http.collectHeaders(const_cast<const char**>(watchResponseHeaders_),
+                        watchResponseHeaderCount_);
   }
   http.addHeader("Content-Type", "application/octet-stream");
   http.addHeader("X-Namz-Device", String(deviceId_));
   http.addHeader("X-Namz-Signature", hmacSha256Hex(hmacSecret_, body, len).c_str());
   int code = http.POST(const_cast<uint8_t*>(body), len);
   bool ok = (code >= 200 && code < 300);
-  if (ok && watchResponseHeader_) {
-    lastResponseHeaderValue_ = http.header(watchResponseHeader_);
+  if (ok) {
+    for (size_t i = 0; i < watchResponseHeaderCount_; ++i) {
+      lastResponseHeaderValues_[i] = http.header(watchResponseHeaders_[i]);
+    }
   }
   http.end();
   if (!ok) {
@@ -179,6 +186,13 @@ size_t Uploader::flushToSpill() {
     ++n;
   }
   return n;
+}
+
+String Uploader::lastResponseHeaderValue(const char* headerName) const {
+  for (size_t i = 0; i < watchResponseHeaderCount_; ++i) {
+    if (strcmp(watchResponseHeaders_[i], headerName) == 0) return lastResponseHeaderValues_[i];
+  }
+  return String();
 }
 
 bool Uploader::oldestQueuedStartUs(uint64_t& outStartUs) const {

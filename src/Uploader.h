@@ -18,14 +18,22 @@
 
 class Uploader {
  public:
-  // watchResponseHeader: 設定すると、バッチPOSTが成功した時にそのレスポンス
-  // ヘッダの値を保持し lastResponseHeaderValue() で読めるようになる（オプトイン、
-  // 既定nullptrで従来通りヘッダを一切見ない）。この層はヘッダを読んで渡すだけで
-  // 意味づけは持たない——「何のヘッダか・値をどう解釈するか」は呼び出し側の責務。
-  // Electabuzz等の他プロジェクトを巻き込まないための設計（dropOldestWhenFullと同じ考え方）。
+  // watchResponseHeaders/watchResponseHeaderCount: 設定すると、バッチPOSTが
+  // 成功した時にそれらのレスポンスヘッダの値を保持し lastResponseHeaderValue()
+  // で読めるようになる（オプトイン、既定nullptr/0で従来通りヘッダを一切見ない）。
+  // この層はヘッダを読んで渡すだけで意味づけは持たない——「何のヘッダか・値を
+  // どう解釈するか」は呼び出し側の責務。Electabuzz等の他プロジェクトを
+  // 巻き込まないための設計（dropOldestWhenFullと同じ考え方）。
+  // watchResponseHeadersが指す配列はUploaderの寿命の間ずっと有効でなければ
+  // ならない（コピーせずポインタを保持する。呼び出し側は静的な配列を渡すこと）。
+  // kMaxWatchedHeadersを超える分は無視する。
+  static constexpr size_t kMaxWatchedHeaders = 4;
+
   Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
            uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
-           bool dropOldestWhenFull = false, const char* watchResponseHeader = nullptr);
+           bool dropOldestWhenFull = false,
+           const char* const* watchResponseHeaders = nullptr,
+           size_t watchResponseHeaderCount = 0);
 
   // 起動時に LittleFS をマウントし退避ファイル数を数える。
   bool begin();
@@ -62,10 +70,10 @@ class Uploader {
   // 書き込みが途中で失敗したら、そこで止めて残りはRAMに置いたまま返す。
   size_t flushToSpill();
 
-  // watchResponseHeader が設定されている時、直近成功したバッチPOSTのレスポンスに
-  // そのヘッダがあればその値、無ければ空文字列。watchResponseHeader==nullptrなら
-  // 常に空文字列。POSTが失敗した回は更新しない（前回成功時の値を保持）。
-  String lastResponseHeaderValue() const { return lastResponseHeaderValue_; }
+  // headerNameがwatchResponseHeadersに含まれていれば、直近成功したバッチPOSTの
+  // レスポンスでのその値（無ければ空文字列）。含まれていなければ常に空文字列。
+  // POSTが失敗した回は更新しない（前回成功時の値を保持）。
+  String lastResponseHeaderValue(const char* headerName) const;
 
  private:
   bool postBatch(const uint8_t* body, size_t len);
@@ -81,12 +89,13 @@ class Uploader {
   uint32_t maxRam_;
   const char* spillDir_;
   bool dropOldestWhenFull_;
-  const char* watchResponseHeader_;
+  const char* const* watchResponseHeaders_;
+  size_t watchResponseHeaderCount_;
 
   std::deque<Batch*> ram_;
   size_t spillCount_ = 0;
   size_t droppedCount_ = 0;
-  String lastResponseHeaderValue_;
+  String lastResponseHeaderValues_[kMaxWatchedHeaders];
   uint32_t backoffMs_ = 0;
   uint32_t nextAttemptMs_ = 0;
 };
