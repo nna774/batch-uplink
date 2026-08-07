@@ -31,6 +31,7 @@ Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmac
           extraRequestHeaderNames ? min(extraRequestHeaderCount, kMaxExtraRequestHeaders) : 0) {}
 
 bool Uploader::begin() {
+  client_.setInsecure();  // TODO: Function URL のルート証明書をピン留めする
   if (!LittleFS.begin(true)) {
     Serial.println("[uploader] LittleFS mount failed");
     return false;
@@ -116,41 +117,57 @@ bool Uploader::pump() {
     nextAttemptMs_ = now + backoffMs_;
     return false;
   }
+  // 送るものが無い: 使い回していた接続を明示的に閉じる。繋ぎっぱなしにすると
+  // 次にバッチが来るまでTLSセッション分のRAMを無駄に予約し続けてしまう
+  // （使い回しの狙いはバックフィルの連続POST中のハンドシェイク省略であって、
+  // 常時接続の維持ではない）。
+  closeIdleConnection();
   return false;
 }
 
 bool Uploader::postBatch(const uint8_t* body, size_t len) {
-  WiFiClientSecure client;
-  client.setInsecure();  // TODO: Function URL のルート証明書をピン留めする
-  HTTPClient http;
-  if (!http.begin(client, ingestUrl_)) return false;
+  // client_/http_ はUploaderの寿命だけ生きるメンバ（バックフィル中の連続POSTで
+  // TLSハンドシェイクを省略するための使い回し。docs参照）。setReuse(true)で
+  // 「切断時に使い回せるなら閉じない」をHTTPClientへ伝える。前回の接続が
+  // まだ生きていればHTTPClient::connect()が自動でハンドシェイクを省略する。
+  if (!http_.begin(client_, ingestUrl_)) return false;
+  http_.setReuse(true);
   if (watchResponseHeaderCount_ > 0) {
     // HTTPClient::collectHeaders は const-correct でない(const char* headerKeys[])。
     // 中身を書き換えないことは分かっているのでconst_castで橋渡しする。
-    http.collectHeaders(const_cast<const char**>(watchResponseHeaders_),
-                        watchResponseHeaderCount_);
+    http_.collectHeaders(const_cast<const char**>(watchResponseHeaders_),
+                         watchResponseHeaderCount_);
   }
-  http.addHeader("Content-Type", "application/octet-stream");
-  http.addHeader("X-Namz-Device", String(deviceId_));
-  http.addHeader("X-Namz-Signature", hmacSha256Hex(hmacSecret_, body, len).c_str());
+  http_.addHeader("Content-Type", "application/octet-stream");
+  http_.addHeader("X-Namz-Device", String(deviceId_));
+  http_.addHeader("X-Namz-Signature", hmacSha256Hex(hmacSecret_, body, len).c_str());
   for (size_t i = 0; i < extraRequestHeaderCount_; ++i) {
-    http.addHeader(extraRequestHeaderNames_[i], extraRequestHeaderValues_[i]);
+    http_.addHeader(extraRequestHeaderNames_[i], extraRequestHeaderValues_[i]);
   }
-  int code = http.POST(const_cast<uint8_t*>(body), len);
+  int code = http_.POST(const_cast<uint8_t*>(body), len);
   bool ok = (code >= 200 && code < 300);
   if (ok) {
     for (size_t i = 0; i < watchResponseHeaderCount_; ++i) {
-      lastResponseHeaderValues_[i] = http.header(watchResponseHeaders_[i]);
+      lastResponseHeaderValues_[i] = http_.header(watchResponseHeaders_[i]);
     }
   }
-  http.end();
+  // end()はここで必ず呼ぶ（次のaddHeader()向けにヘッダ状態をクリアするため）。
+  // ソケット自体はsetReuse(true)とサーバのkeep-alive応答次第で閉じずに残る。
+  http_.end();
   if (!ok) {
     // TLSハンドシェイクは大きな連続ブロックを要求するので、空きの総量より
     // 「取れる最大ブロック」が効く。code=-1 が続く時はここを見る。
     Serial.printf("[uploader] POST failed code=%d (heap free=%u maxblock=%u)\n",
                   code, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    // 失敗した接続を次回に持ち越さない。壊れた/不明な状態のソケットを
+    // 使い回そうとして再度失敗し続けるのを避け、次回は必ず繋ぎ直す。
+    client_.stop();
   }
   return ok;
+}
+
+void Uploader::closeIdleConnection() {
+  if (client_.connected()) client_.stop();
 }
 
 bool Uploader::sendAlert(const char* json, size_t len) {

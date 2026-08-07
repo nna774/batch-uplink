@@ -10,6 +10,8 @@
 // （呼び出し側が明示的に選ばない限り不変条件は変わらない）。
 
 #include <Arduino.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 #include <deque>
 #include <cstdint>
@@ -94,6 +96,7 @@ class Uploader {
   bool loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs) const;
   void removeSpill(const char* path);
   bool evictOldestSpill();             // 退避ファイルの最古を1本消す（空きを作る）
+  void closeIdleConnection();          // 送るものが無くなった時にingest向け接続を明示的に閉じる
 
   const char* ingestUrl_;
   const char* alertUrl_;
@@ -114,4 +117,11 @@ class Uploader {
   String lastResponseHeaderValues_[kMaxWatchedHeaders];
   uint32_t backoffMs_ = 0;
   uint32_t nextAttemptMs_ = 0;
+
+  // ingest向けのTCP/TLS接続をpostBatch()呼び出しをまたいで使い回す
+  // （バックフィルで連続POSTする時のTLSハンドシェイク連発を避けるため）。
+  // sendAlert()は宛先ホストが別（alertUrl_）なので、使い回すとホスト切り替えの
+  // たびに切断が挟まり意味が無い。専用のローカル接続のまま変えていない。
+  WiFiClientSecure client_;
+  HTTPClient http_;
 };
