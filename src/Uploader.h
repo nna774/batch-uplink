@@ -41,6 +41,15 @@ class Uploader {
   // kMaxExtraRequestHeadersを超える分は無視する。
   static constexpr size_t kMaxExtraRequestHeaders = 4;
 
+  // caCert: ingest/alert先（Function URL）を検証するルートCA証明書（PEM文字列）。
+  // 渡すとTLS検証にsetCACert()を使う。既定nullptrでは従来通りsetInsecure()
+  // （検証なし）にフォールバックする——呼び出し側がまだ証明書を持たない場合に
+  // 動かなくならないようにするための互換維持で、推奨は常に渡すこと。
+  // 呼び出し側の証明書取得元は問わない（例:
+  // firmware/certs/amazon_root_ca1.pem をplatformio.iniのboard_build.embed_txtfiles
+  // でリンクする、NamazuHaUrokoGaNaiのOTA取得と同じ手法）。
+  // 渡す場合、caCertが指す文字列はUploaderの寿命の間ずっと有効でなければ
+  // ならない（コピーせずポインタを保持する。呼び出し側は静的/embedな領域を渡すこと）。
   Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
            uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
            bool dropOldestWhenFull = false,
@@ -48,7 +57,8 @@ class Uploader {
            size_t watchResponseHeaderCount = 0,
            const char* const* extraRequestHeaderNames = nullptr,
            const char* const* extraRequestHeaderValues = nullptr,
-           size_t extraRequestHeaderCount = 0);
+           size_t extraRequestHeaderCount = 0,
+           const char* caCert = nullptr);
 
   // 起動時に LittleFS をマウントし退避ファイル数を数える。
   bool begin();
@@ -110,6 +120,7 @@ class Uploader {
   const char* const* extraRequestHeaderNames_;
   const char* const* extraRequestHeaderValues_;
   size_t extraRequestHeaderCount_;
+  const char* caCert_;
 
   std::deque<Batch*> ram_;
   size_t spillCount_ = 0;

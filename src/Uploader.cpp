@@ -19,7 +19,7 @@ Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmac
                    size_t watchResponseHeaderCount,
                    const char* const* extraRequestHeaderNames,
                    const char* const* extraRequestHeaderValues,
-                   size_t extraRequestHeaderCount)
+                   size_t extraRequestHeaderCount, const char* caCert)
     : ingestUrl_(ingestUrl), alertUrl_(alertUrl), hmacSecret_(hmacSecret),
       deviceId_(deviceId), maxRam_(maxRamBatches), spillDir_(spillDir),
       dropOldestWhenFull_(dropOldestWhenFull), watchResponseHeaders_(watchResponseHeaders),
@@ -28,10 +28,15 @@ Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmac
       extraRequestHeaderNames_(extraRequestHeaderNames),
       extraRequestHeaderValues_(extraRequestHeaderValues),
       extraRequestHeaderCount_(
-          extraRequestHeaderNames ? min(extraRequestHeaderCount, kMaxExtraRequestHeaders) : 0) {}
+          extraRequestHeaderNames ? min(extraRequestHeaderCount, kMaxExtraRequestHeaders) : 0),
+      caCert_(caCert) {}
 
 bool Uploader::begin() {
-  client_.setInsecure();  // TODO: Function URL のルート証明書をピン留めする
+  if (caCert_) {
+    client_.setCACert(caCert_);
+  } else {
+    client_.setInsecure();  // caCert未指定時の後方互換フォールバック（検証なし）
+  }
   if (!LittleFS.begin(true)) {
     Serial.println("[uploader] LittleFS mount failed");
     return false;
@@ -173,7 +178,11 @@ void Uploader::closeIdleConnection() {
 bool Uploader::sendAlert(const char* json, size_t len) {
   if (WiFi.status() != WL_CONNECTED) return false;
   WiFiClientSecure client;
-  client.setInsecure();
+  if (caCert_) {
+    client.setCACert(caCert_);
+  } else {
+    client.setInsecure();  // caCert未指定時の後方互換フォールバック（検証なし）
+  }
   HTTPClient http;
   if (!http.begin(client, alertUrl_)) return false;
   http.addHeader("Content-Type", "application/json");
