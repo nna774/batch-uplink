@@ -13,23 +13,27 @@
 static constexpr uint32_t kBackoffStartMs = 1000;
 static constexpr uint32_t kBackoffMaxMs = 60000;
 
+// nullptr終端の配列(argv方式)の要素数を数える。arr自体がnullptrなら0。
+static size_t countSentinelArray(const char* const* arr) {
+  if (!arr) return 0;
+  size_t n = 0;
+  while (arr[n]) ++n;
+  return n;
+}
+
 Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
                    uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
                    bool dropOldestWhenFull, const char* const* watchResponseHeaders,
-                   size_t watchResponseHeaderCount,
                    const char* const* extraRequestHeaderNames,
-                   const char* const* extraRequestHeaderValues,
-                   size_t extraRequestHeaderCount, const char* caCert)
+                   const char* const* extraRequestHeaderValues, const char* caCert)
     : ingestUrl_(ingestUrl), alertUrl_(alertUrl), hmacSecret_(hmacSecret),
       deviceId_(deviceId), maxRam_(maxRamBatches), spillDir_(spillDir),
       dropOldestWhenFull_(dropOldestWhenFull), watchResponseHeaders_(watchResponseHeaders),
-      watchResponseHeaderCount_(
-          watchResponseHeaders ? min(watchResponseHeaderCount, kMaxWatchedHeaders) : 0),
+      watchResponseHeaderCount_(countSentinelArray(watchResponseHeaders)),
       extraRequestHeaderNames_(extraRequestHeaderNames),
       extraRequestHeaderValues_(extraRequestHeaderValues),
-      extraRequestHeaderCount_(
-          extraRequestHeaderNames ? min(extraRequestHeaderCount, kMaxExtraRequestHeaders) : 0),
-      caCert_(caCert) {}
+      extraRequestHeaderCount_(countSentinelArray(extraRequestHeaderNames)),
+      caCert_(caCert), lastResponseHeaderValues_(watchResponseHeaderCount_) {}
 
 bool Uploader::begin() {
   if (caCert_) {
