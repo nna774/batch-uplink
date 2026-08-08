@@ -14,32 +14,30 @@
 #include <WiFiClientSecure.h>
 
 #include <deque>
+#include <vector>
 #include <cstdint>
 
 #include "Batch.h"
 
 class Uploader {
  public:
-  // watchResponseHeaders/watchResponseHeaderCount: 設定すると、バッチPOSTが
-  // 成功した時にそれらのレスポンスヘッダの値を保持し lastResponseHeaderValue()
-  // で読めるようになる（オプトイン、既定nullptr/0で従来通りヘッダを一切見ない）。
-  // この層はヘッダを読んで渡すだけで意味づけは持たない——「何のヘッダか・値を
-  // どう解釈するか」は呼び出し側の責務。Electabuzz等の他プロジェクトを
-  // 巻き込まないための設計（dropOldestWhenFullと同じ考え方）。
-  // watchResponseHeadersが指す配列はUploaderの寿命の間ずっと有効でなければ
-  // ならない（コピーせずポインタを保持する。呼び出し側は静的な配列を渡すこと）。
-  // kMaxWatchedHeadersを超える分は無視する。
-  static constexpr size_t kMaxWatchedHeaders = 4;
+  // watchResponseHeaders: 設定すると、バッチPOSTが成功した時にそれらのレスポンス
+  // ヘッダの値を保持し lastResponseHeaderValue() で読めるようになる（オプトイン、
+  // 既定nullptrで従来通りヘッダを一切見ない）。この層はヘッダを読んで渡すだけで
+  // 意味づけは持たない——「何のヘッダか・値をどう解釈するか」は呼び出し側の責務。
+  // Electabuzz等の他プロジェクトを巻き込まないための設計（dropOldestWhenFullと
+  // 同じ考え方）。**nullptr終端の配列**（末尾に1個nullptrを置く。本数を別引数で
+  // 渡す必要はない）。watchResponseHeadersが指す配列はUploaderの寿命の間ずっと
+  // 有効でなければならない（コピーせずポインタを保持する。呼び出し側は静的な
+  // 配列を渡すこと）。
 
-  // extraRequestHeaderNames/Values/Count: 設定すると、バッチPOSTのたびにそれらの
-  // ヘッダをリクエストへ付ける（オプトイン、既定nullptr/0で従来通り追加しない）。
+  // extraRequestHeaderNames/Values: 設定すると、バッチPOSTのたびにそれらの
+  // ヘッダをリクエストへ付ける（オプトイン、既定nullptrで従来通り追加しない）。
   // watchResponseHeadersと対称の設計——ここも「決まった名前・値のヘッダを
   // 送るだけ」の汎用APIで、何を送るかの意味づけは呼び出し側の責務。
-  // namesとvaluesは同じ長さの配列で、names[i]の値がvalues[i]。値を毎回
-  // 変えたい場合は呼び出し側がvalues配列の指す先を書き換えればよい
-  // （Uploaderはコピーせずポインタを保持する。呼び出し側は静的な配列を渡すこと）。
-  // kMaxExtraRequestHeadersを超える分は無視する。
-  static constexpr size_t kMaxExtraRequestHeaders = 4;
+  // namesは**nullptr終端の配列**、valuesは同じ本数（終端不要）。names[i]の値が
+  // values[i]。値を毎回変えたい場合は呼び出し側がvalues配列の指す先を書き換えれば
+  // よい（Uploaderはコピーせずポインタを保持する。呼び出し側は静的な配列を渡すこと）。
 
   // caCert: ingest/alert先（Function URL）を検証するルートCA証明書（PEM文字列）。
   // 渡すとTLS検証にsetCACert()を使う。既定nullptrでは従来通りsetInsecure()
@@ -54,10 +52,8 @@ class Uploader {
            uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
            bool dropOldestWhenFull = false,
            const char* const* watchResponseHeaders = nullptr,
-           size_t watchResponseHeaderCount = 0,
            const char* const* extraRequestHeaderNames = nullptr,
            const char* const* extraRequestHeaderValues = nullptr,
-           size_t extraRequestHeaderCount = 0,
            const char* caCert = nullptr);
 
   // 起動時に LittleFS をマウントし退避ファイル数を数える。
@@ -125,7 +121,7 @@ class Uploader {
   std::deque<Batch*> ram_;
   size_t spillCount_ = 0;
   size_t droppedCount_ = 0;
-  String lastResponseHeaderValues_[kMaxWatchedHeaders];
+  std::vector<String> lastResponseHeaderValues_;
   uint32_t backoffMs_ = 0;
   uint32_t nextAttemptMs_ = 0;
 
