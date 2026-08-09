@@ -15,6 +15,21 @@
 static constexpr uint32_t kBackoffStartMs = 1000;
 static constexpr uint32_t kBackoffMaxMs = 60000;
 
+// WiFiClientSecureの既定は120000ms。呼び出し側(uploaderTask)の10秒task
+// watchdogより長いため、ネット瞬断でTLSハンドシェイクが詰まるとハンドシェイクの
+// タイムアウトより先にWDTが強制パニック再起動させてしまう（実機で確認、
+// NamazuHaUrokoGaNai docs/log/2026-08-09-device1-outage-reboot-loop-and-data-loss.md）。
+// パニックは`flushToSpill()`を経由しないためRAM上のバッチを毎回失う。ここを
+// WDTの10秒未満に縮め、詰まった時はライブラリ自身が先に諦めて接続失敗を返す
+// ようにし、既存の指数バックオフによる通常の再試行に落とす。
+//
+// HTTPClientの`_connectTimeout`/`_tcpTimeout`は既定5000ms
+// (`HTTPCLIENT_DEFAULT_TCP_TIMEOUT`、TCP接続確立と送受信を別々にカバー)なので
+// 既に10秒未満で安全。唯一守られていないのがこのハンドシェイクタイムアウトだった。
+// 「TCP接続に近い5秒＋ハンドシェイクここ」が直列に積み上がっても10秒に収まるよう、
+// design.mdの当初案(8000ms)よりさらに切り詰めて4000msにする。
+static constexpr uint32_t kHandshakeTimeoutMs = 4000;
+
 // postBatch()の各段階(http_.begin()/http_.POST()前後)にタイムスタンプ付きログを
 // 出す。既定オフ(呼び出し側のbuild_flagsで-DUPLINK_DEBUG_TIMINGを渡した時だけ
 // 有効)、コンパイル時に消えるのでオフ時はコストゼロ。「詰まって戻ってこない」
@@ -56,6 +71,7 @@ bool Uploader::begin() {
   } else {
     client_.setInsecure();  // caCert未指定時の後方互換フォールバック（検証なし）
   }
+  client_.setHandshakeTimeout(kHandshakeTimeoutMs);
   if (!LittleFS.begin(true)) {
     Serial.println("[uploader] LittleFS mount failed");
     return false;
@@ -214,6 +230,7 @@ bool Uploader::sendAlert(const char* json, size_t len) {
   } else {
     client.setInsecure();  // caCert未指定時の後方互換フォールバック（検証なし）
   }
+  client.setHandshakeTimeout(kHandshakeTimeoutMs);
   HTTPClient http;
   if (!http.begin(client, alertUrl_)) return false;
   http.addHeader("Content-Type", "application/json");
