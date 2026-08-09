@@ -10,8 +10,23 @@
 
 #include "HmacSha256.h"
 
+#include "esp_timer.h"
+
 static constexpr uint32_t kBackoffStartMs = 1000;
 static constexpr uint32_t kBackoffMaxMs = 60000;
+
+// postBatch()の各段階(http_.begin()/http_.POST()前後)にタイムスタンプ付きログを
+// 出す。既定オフ(呼び出し側のbuild_flagsで-DUPLINK_DEBUG_TIMINGを渡した時だけ
+// 有効)、コンパイル時に消えるのでオフ時はコストゼロ。「詰まって戻ってこない」
+// 系の障害調査用——begin()とPOST()のどちらの前で最後のログが止まったかを見れば、
+// TCP接続確立とTLSハンドシェイク+送受信のどちらでブロックしているか切り分けられる。
+#ifdef UPLINK_DEBUG_TIMING
+#define UPLINK_DEBUG_LOG(...) Serial.printf(__VA_ARGS__)
+#else
+#define UPLINK_DEBUG_LOG(...) \
+  do {                        \
+  } while (0)
+#endif
 
 // nullptr終端の配列(argv方式)の要素数を数える。arr自体がnullptrなら0。
 static size_t countSentinelArray(const char* const* arr) {
@@ -135,11 +150,19 @@ bool Uploader::pump() {
 }
 
 bool Uploader::postBatch(const uint8_t* body, size_t len) {
+  UPLINK_DEBUG_LOG(
+      "[uplink-debug] postBatch begin len=%u wifi=%d client_connected=%d heap_free=%u "
+      "maxblock=%u t=%lld\n",
+      (unsigned)len, (int)WiFi.status(), (int)client_.connected(), (unsigned)ESP.getFreeHeap(),
+      (unsigned)ESP.getMaxAllocHeap(), (long long)esp_timer_get_time());
   // client_/http_ はUploaderの寿命だけ生きるメンバ（バックフィル中の連続POSTで
   // TLSハンドシェイクを省略するための使い回し。docs参照）。setReuse(true)で
   // 「切断時に使い回せるなら閉じない」をHTTPClientへ伝える。前回の接続が
   // まだ生きていればHTTPClient::connect()が自動でハンドシェイクを省略する。
-  if (!http_.begin(client_, ingestUrl_)) return false;
+  bool began = http_.begin(client_, ingestUrl_);
+  UPLINK_DEBUG_LOG("[uplink-debug] http_.begin() -> %d t=%lld\n", (int)began,
+                    (long long)esp_timer_get_time());
+  if (!began) return false;
   http_.setReuse(true);
   if (watchResponseHeaderCount_ > 0) {
     // HTTPClient::collectHeaders は const-correct でない(const char* headerKeys[])。
@@ -153,7 +176,11 @@ bool Uploader::postBatch(const uint8_t* body, size_t len) {
   for (size_t i = 0; i < extraRequestHeaderCount_; ++i) {
     http_.addHeader(extraRequestHeaderNames_[i], extraRequestHeaderValues_[i]);
   }
+  UPLINK_DEBUG_LOG("[uplink-debug] http_.POST() start len=%u t=%lld\n", (unsigned)len,
+                    (long long)esp_timer_get_time());
   int code = http_.POST(const_cast<uint8_t*>(body), len);
+  UPLINK_DEBUG_LOG("[uplink-debug] http_.POST() -> code=%d t=%lld\n", code,
+                    (long long)esp_timer_get_time());
   bool ok = (code >= 200 && code < 300);
   if (ok) {
     for (size_t i = 0; i < watchResponseHeaderCount_; ++i) {
