@@ -89,9 +89,16 @@ bool Uploader::begin() {
 
 void Uploader::enqueue(Batch* batch) {
   if (!batch || !batch->valid()) {
+    UPLINK_DEBUG_LOG("[uplink-debug] enqueue: invalid batch, dropped (batch=%p)\n",
+                      (void*)batch);
     delete batch;
     return;
   }
+  static uint32_t sEnqueueCount = 0;
+  UPLINK_DEBUG_LOG(
+      "[uplink-debug] enqueue #%u len=%u ram=%u spill=%u t=%lld\n",
+      (unsigned)++sEnqueueCount, (unsigned)batch->size(), (unsigned)ram_.size(),
+      (unsigned)spillCount_, (long long)esp_timer_get_time());
   while (ram_.size() >= maxRam_) {
     if (spillOldestRam()) continue;
     if (!dropOldestWhenFull_) break;  // 従来通り: 諦めて積む（メモリ許す範囲）
