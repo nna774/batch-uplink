@@ -153,6 +153,20 @@ void Uploader::enqueue(Batch* batch) {
 }
 
 bool Uploader::pump() {
+  // 送信が連続して詰まり、バックオフが上限(kBackoffMaxMs)に張り付いている間は、
+  // ram_に居座っている未送信バッチをspillへ逃がしておく。
+  //
+  // spillへの退避は本来enqueue()がRAM満杯を検知した時の副作用としてしか起きない
+  // 設計だが、送信が詰まったままRAMも満杯だと、呼び出し側(NamazuHaUrokoGaNai)の
+  // Batchバッファプールも同時に枯渇し、新しいバッチを作れなくなる。すると
+  // enqueue()が二度と呼ばれなくなり、退避のトリガー自体が永遠に来ない飢餓状態に
+  // 陥る——実機のWiFi遮断試験で確認した(newBatch()が延々失敗し続けるだけで
+  // 何時間経っても回復しない、NamazuHaUrokoGaNai
+  // docs/log/2026-08-11-uploader-task-split-realhw-check.md)。
+  // WiFi接続状態に関わらず呼んでよい(flushToSpill()はLittleFSのみで完結する)。
+  if (backoffMs_ >= kBackoffMaxMs) {
+    flushToSpill();
+  }
   if (WiFi.status() != WL_CONNECTED) {
     UPLINK_DEBUG_LOG("[uplink-debug] pump: wifi not connected (status=%d) t=%lld\n",
                       (int)WiFi.status(), (long long)esp_timer_get_time());
