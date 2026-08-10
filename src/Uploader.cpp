@@ -136,7 +136,19 @@ bool Uploader::pump() {
     if (loadOldestSpillPath(path, sizeof(path), startUs)) {
       UPLINK_DEBUG_LOG("[uplink-debug] pump: loadOldestSpillPath -> %s t=%lld\n", path,
                         (long long)esp_timer_get_time());
-      File f = LittleFS.open(path, "r");
+      // LittleFS.open()はArduino-ESP32のFS実装内部でstd::make_shared<VFSFileImpl>を
+      // 使っており、ヒープが極端に逼迫した状態でそのnew()が失敗すると
+      // std::bad_alloc相当の例外を投げる。ここをcatchせずに素通しすると
+      // std::terminate()->abort()で機体ごと再起動する（実機で確認）。
+      // ヒープ枯渇自体はここで直せる問題ではないので、例外は「開けなかった」
+      // という通常の失敗として扱い、既存のバックオフ経路に流す。
+      File f;
+      try {
+        f = LittleFS.open(path, "r");
+      } catch (...) {
+        Serial.printf("[uploader] LittleFS.open(%s) threw (heap exhausted?) t=%lld\n", path,
+                      (long long)esp_timer_get_time());
+      }
       if (f) {
         size_t len = f.size();
         UPLINK_DEBUG_LOG("[uplink-debug] pump: opened %s len=%u t=%lld\n", path, (unsigned)len,
@@ -331,12 +343,23 @@ bool Uploader::oldestQueuedStartUs(uint64_t& outStartUs) const {
 }
 
 bool Uploader::loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs) const {
-  File dir = LittleFS.open(spillDir_);
+  // LittleFS.open()/File::openNextFile()はどちらもArduino-ESP32のFS実装内部で
+  // std::make_shared<VFSFileImpl>を使う。ヒープ逼迫時にそのnew()が失敗すると
+  // 未捕捉例外->abort()で機体ごと再起動する（pump()側の同種コメント参照、
+  // 実機で確認済み）。ここは呼び出し元がpump()とoldestQueuedStartUs()の両方に
+  // またがるため、失敗を「退避ファイルが見つからなかった」扱いに落として
+  // 呼び出し元に伝える。
   String oldest;
-  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-    if (f.isDirectory()) continue;
-    String name = f.name();
-    if (oldest.isEmpty() || name < oldest) oldest = name;
+  try {
+    File dir = LittleFS.open(spillDir_);
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+      if (f.isDirectory()) continue;
+      String name = f.name();
+      if (oldest.isEmpty() || name < oldest) oldest = name;
+    }
+  } catch (...) {
+    Serial.printf("[uploader] loadOldestSpillPath(%s) threw (heap exhausted?)\n", spillDir_);
+    return false;
   }
   if (oldest.isEmpty()) return false;
   snprintf(out, outLen, "%s/%s", spillDir_, oldest.c_str());
