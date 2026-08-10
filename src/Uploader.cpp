@@ -224,6 +224,12 @@ bool Uploader::pump() {
   {
     UploaderLock lock(mutex_);
     if (spillCount_ > 0 && loadOldestSpillPath(path, sizeof(path), startUs)) {
+      // spillCount_>0なのにloadOldestSpillPath()が見つけられない場合だけを
+      // 「FAILED」とログしたい（spillCount_==0で退避ファイルが単に無い、という
+      // 普段の状態と、カウンタと実ファイルがズレている異常を混同しないため）。
+      // &&の短絡評価に頼って両者を1本のログにまとめると、平常時(spillCount_==0)
+      // 毎回「FAILED」が出て紛らわしくなる——実際に踏んだ(pump()が空振りする
+      // たびに出続けていた)ので、下のelse節で明示的に分けた。
       UPLINK_DEBUG_LOG("[uplink-debug] pump: loadOldestSpillPath -> %s t=%lld\n", path,
                         (long long)esp_timer_get_time());
       // LittleFS.open()はArduino-ESP32のFS実装内部でstd::make_shared<VFSFileImpl>を
@@ -268,10 +274,14 @@ bool Uploader::pump() {
         UPLINK_DEBUG_LOG("[uplink-debug] pump: LittleFS.open(%s) FAILED t=%lld\n", path,
                           (long long)esp_timer_get_time());
       }
-    } else {
-      UPLINK_DEBUG_LOG("[uplink-debug] pump: loadOldestSpillPath FAILED t=%lld\n",
-                        (long long)esp_timer_get_time());
+    } else if (spillCount_ > 0) {
+      // spillCount_はある(>0)のに実ファイルが見つからない——カウンタと実体が
+      // ズレている異常なので、平常時の「spillが単に空」と区別してログする。
+      UPLINK_DEBUG_LOG("[uplink-debug] pump: loadOldestSpillPath FAILED (spillCount_=%u) t=%lld\n",
+                        (unsigned)spillCount_, (long long)esp_timer_get_time());
     }
+    // spillCount_==0の場合はここで何もログしない(退避ファイルが単に無いだけの
+    // 平常状態、pump()呼び出しのたびに出ると紛らわしい)。
   }
   if (path[0] == '\0') {
     // 送るものが無い: 使い回していた接続を明示的に閉じる。繋ぎっぱなしにすると
