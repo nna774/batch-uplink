@@ -153,20 +153,32 @@ void Uploader::enqueue(Batch* batch) {
 }
 
 bool Uploader::pump() {
-  // 送信が連続して詰まり、バックオフが上限(kBackoffMaxMs)に張り付いている間は、
-  // ram_に居座っている未送信バッチをspillへ逃がしておく。
+  // ram_がmaxRam_に達している間は、待たずに毎回flushToSpill()を試みる。
   //
   // spillへの退避は本来enqueue()がRAM満杯を検知した時の副作用としてしか起きない
-  // 設計だが、送信が詰まったままRAMも満杯だと、呼び出し側(NamazuHaUrokoGaNai)の
-  // Batchバッファプールも同時に枯渇し、新しいバッチを作れなくなる。すると
-  // enqueue()が二度と呼ばれなくなり、退避のトリガー自体が永遠に来ない飢餓状態に
-  // 陥る——実機のWiFi遮断試験で確認した(newBatch()が延々失敗し続けるだけで
-  // 何時間経っても回復しない、NamazuHaUrokoGaNai
+  // 設計だが、送信が詰まったままRAMも満杯だと、呼び出し側(firmware)のBatch
+  // バッファプールも同時に枯渇し新しいバッチを作れなくなる。すると enqueue()
+  // が二度と呼ばれなくなり退避のトリガー自体が永遠に来ない飢餓状態に陥る
+  // ——実機のWiFi遮断試験で確認した(NamazuHaUrokoGaNai
   // docs/log/2026-08-11-uploader-task-split-realhw-check.md)。
+  //
+  // 最初はこのチェックを「バックオフが上限(kBackoffMaxMs=60秒)に張り付いた
+  // 時だけ」にしていたが、遅すぎると判明した——プール枯渇中は呼び出し側の
+  // samplingTaskが生サンプルをその場で捨て続ける(Batchを組み立てられない
+  // ため)ので、60秒待つ設計では60秒ぶんの生波形データが継続的に欠測する。
+  // ram_.size()>=maxRam_はpump()の毎呼び出し(~50ms周期)で安価にチェックでき、
+  // かつ「これ以上RAMに置いておく意味がない(どうせ次のenqueue()で退避される
+  // 運命)」という状態を直接表す信号なので、これに差し替えた。
   // WiFi接続状態に関わらず呼んでよい(flushToSpill()はLittleFSのみで完結する)。
-  if (backoffMs_ >= kBackoffMaxMs) {
-    flushToSpill();
+  // flushToSpill()自身が別途mutex_を取るため、ここではまずram_.size()だけを
+  // ロック内で読んでロックを手放してから呼ぶ(非再入mutexの二重取得を避ける)。
+  bool ramFull = false;
+  {
+    UploaderLock lock(mutex_);
+    ramFull = ram_.size() >= maxRam_;
   }
+  if (ramFull) flushToSpill();
+
   if (WiFi.status() != WL_CONNECTED) {
     UPLINK_DEBUG_LOG("[uplink-debug] pump: wifi not connected (status=%d) t=%lld\n",
                       (int)WiFi.status(), (long long)esp_timer_get_time());
