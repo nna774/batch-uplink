@@ -115,22 +115,41 @@ void Uploader::enqueue(Batch* batch) {
 }
 
 bool Uploader::pump() {
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: wifi not connected (status=%d) t=%lld\n",
+                      (int)WiFi.status(), (long long)esp_timer_get_time());
+    return false;
+  }
   uint32_t now = millis();
-  if (now < nextAttemptMs_) return false;
+  if (now < nextAttemptMs_) {
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: backoff active (now=%u next=%u) t=%lld\n",
+                      (unsigned)now, (unsigned)nextAttemptMs_, (long long)esp_timer_get_time());
+    return false;
+  }
 
   // 1) 退避ファイル（常に古い）を優先で送る
   if (spillCount_ > 0) {
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: spill branch, spillCount=%u t=%lld\n",
+                      (unsigned)spillCount_, (long long)esp_timer_get_time());
     char path[64];
     uint64_t startUs;
     if (loadOldestSpillPath(path, sizeof(path), startUs)) {
+      UPLINK_DEBUG_LOG("[uplink-debug] pump: loadOldestSpillPath -> %s t=%lld\n", path,
+                        (long long)esp_timer_get_time());
       File f = LittleFS.open(path, "r");
       if (f) {
         size_t len = f.size();
+        UPLINK_DEBUG_LOG("[uplink-debug] pump: opened %s len=%u t=%lld\n", path, (unsigned)len,
+                          (long long)esp_timer_get_time());
         uint8_t* body = (uint8_t*)malloc(len);
-        if (body && f.read(body, len) == (int)len) {
+        int readLen = body ? f.read(body, len) : -1;
+        UPLINK_DEBUG_LOG("[uplink-debug] pump: read -> %d (body=%p) t=%lld\n", readLen,
+                          (void*)body, (long long)esp_timer_get_time());
+        if (body && readLen == (int)len) {
           f.close();
           bool ok = postBatch(body, len);
+          UPLINK_DEBUG_LOG("[uplink-debug] pump: postBatch(spill) -> %d t=%lld\n", (int)ok,
+                            (long long)esp_timer_get_time());
           free(body);
           if (ok) {
             removeSpill(path);
@@ -142,7 +161,13 @@ bool Uploader::pump() {
           if (body) free(body);
           f.close();
         }
+      } else {
+        UPLINK_DEBUG_LOG("[uplink-debug] pump: LittleFS.open(%s) FAILED t=%lld\n", path,
+                          (long long)esp_timer_get_time());
       }
+    } else {
+      UPLINK_DEBUG_LOG("[uplink-debug] pump: loadOldestSpillPath FAILED t=%lld\n",
+                        (long long)esp_timer_get_time());
     }
     // 送れなかった -> バックオフ
     backoffMs_ = backoffMs_ ? min(backoffMs_ * 2, kBackoffMaxMs) : kBackoffStartMs;
@@ -152,8 +177,13 @@ bool Uploader::pump() {
 
   // 2) RAMキューの古い順
   if (!ram_.empty()) {
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: ram branch, ram_.size()=%u t=%lld\n",
+                      (unsigned)ram_.size(), (long long)esp_timer_get_time());
     Batch* b = ram_.front();
-    if (postBatch(b->bytes(), b->size())) {
+    bool ok = postBatch(b->bytes(), b->size());
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: postBatch(ram) -> %d t=%lld\n", (int)ok,
+                      (long long)esp_timer_get_time());
+    if (ok) {
       ram_.pop_front();
       delete b;
       backoffMs_ = 0;
@@ -168,6 +198,8 @@ bool Uploader::pump() {
   // 次にバッチが来るまでTLSセッション分のRAMを無駄に予約し続けてしまう
   // （使い回しの狙いはバックフィルの連続POST中のハンドシェイク省略であって、
   // 常時接続の維持ではない）。
+  UPLINK_DEBUG_LOG("[uplink-debug] pump: nothing to send, closing idle connection t=%lld\n",
+                    (long long)esp_timer_get_time());
   closeIdleConnection();
   return false;
 }
