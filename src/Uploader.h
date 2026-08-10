@@ -48,13 +48,26 @@ class Uploader {
   // でリンクする、NamazuHaUrokoGaNaiのOTA取得と同じ手法）。
   // 渡す場合、caCertが指す文字列はUploaderの寿命の間ずっと有効でなければ
   // ならない（コピーせずポインタを保持する。呼び出し側は静的/embedな領域を渡すこと）。
+  //
+  // maxSpillReadBytes: 指定すると、退避ファイルを読むための領域をbegin()で
+  // 一度だけmalloc()し、以後pump()の退避送信のたびに使い回す（既定0は従来通り
+  // 読むたびにmalloc()/free()する動作）。狙いはBatchバッファ・TLSの確保/解放と
+  // 同じ——同じサイズの確保/解放をヒープ上で繰り返すと、断片化で
+  // ESP32のMALLOC_CAP_8BIT側の最大連続空きブロックがじわじわ削れ、いずれ
+  // malloc()そのものが失敗し続ける現象を実機で確認した(NamazuHaUrokoGaNai
+  // docs/log/2026-08-10-ota-tls-pool-race.md「spill読み込み用mallocの断片化」)。
+  // 指定サイズを超える退避ファイルは読めない(0扱いでスキップ)——呼び出し側は
+  // 送るバッチの最大サイズ以上を渡すこと。begin()でのmalloc失敗時は従来の
+  // 都度malloc/free経路へ安全に縮退する。
   Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
            uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
            bool dropOldestWhenFull = false,
            const char* const* watchResponseHeaders = nullptr,
            const char* const* extraRequestHeaderNames = nullptr,
            const char* const* extraRequestHeaderValues = nullptr,
-           const char* caCert = nullptr);
+           const char* caCert = nullptr, size_t maxSpillReadBytes = 0);
+
+  ~Uploader();
 
   // 起動時に LittleFS をマウントし退避ファイル数を数える。
   bool begin();
@@ -132,6 +145,12 @@ class Uploader {
   std::vector<String> lastResponseHeaderValues_;
   uint32_t backoffMs_ = 0;
   uint32_t nextAttemptMs_ = 0;
+
+  // 退避ファイル読み込み用の固定バッファ（begin()で一度だけmalloc()。
+  // 未指定/malloc失敗時はspillReadBuf_==nullptrのまま、pump()は従来の
+  // 都度malloc/free経路を使う）。
+  size_t maxSpillReadBytes_ = 0;
+  uint8_t* spillReadBuf_ = nullptr;
 
   // ingest向けのTCP/TLS接続をpostBatch()呼び出しをまたいで使い回す
   // （バックフィルで連続POSTする時のTLSハンドシェイク連発を避けるため）。

@@ -57,7 +57,8 @@ Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmac
                    uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
                    bool dropOldestWhenFull, const char* const* watchResponseHeaders,
                    const char* const* extraRequestHeaderNames,
-                   const char* const* extraRequestHeaderValues, const char* caCert)
+                   const char* const* extraRequestHeaderValues, const char* caCert,
+                   size_t maxSpillReadBytes)
     : ingestUrl_(ingestUrl), alertUrl_(alertUrl), hmacSecret_(hmacSecret),
       deviceId_(deviceId), maxRam_(maxRamBatches), spillDir_(spillDir),
       dropOldestWhenFull_(dropOldestWhenFull), watchResponseHeaders_(watchResponseHeaders),
@@ -65,7 +66,12 @@ Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmac
       extraRequestHeaderNames_(extraRequestHeaderNames),
       extraRequestHeaderValues_(extraRequestHeaderValues),
       extraRequestHeaderCount_(countSentinelArray(extraRequestHeaderNames)),
-      caCert_(caCert), lastResponseHeaderValues_(watchResponseHeaderCount_) {}
+      caCert_(caCert), lastResponseHeaderValues_(watchResponseHeaderCount_),
+      maxSpillReadBytes_(maxSpillReadBytes) {}
+
+Uploader::~Uploader() {
+  free(spillReadBuf_);
+}
 
 bool Uploader::begin() {
   if (caCert_) {
@@ -86,6 +92,15 @@ bool Uploader::begin() {
     if (!f.isDirectory()) ++spillCount_;
   }
   Serial.printf("[uploader] spill files on boot: %u\n", (unsigned)spillCount_);
+  if (maxSpillReadBytes_ > 0) {
+    spillReadBuf_ = (uint8_t*)malloc(maxSpillReadBytes_);
+    if (!spillReadBuf_) {
+      Serial.printf(
+          "[uploader] spill read buffer malloc failed (%u B), falling back to "
+          "per-read malloc/free\n",
+          (unsigned)maxSpillReadBytes_);
+    }
+  }
   return true;
 }
 
@@ -129,7 +144,36 @@ bool Uploader::pump() {
     return false;
   }
 
-  // 1) 退避ファイル（常に古い）を優先で送る
+  // 1) RAMキューの古い順を優先で送る。
+  //
+  // 元は退避ファイル（spill）を常に優先していたが、大量backlog（spillが
+  // 尽きない）が続く間RAMキューが一本も送信されず`ram_`が上限で慢性的に
+  // 張り付き、呼び出し側(NamazuHaUrokoGaNai)のBatchバッファプール枯渇→
+  // 一般malloc()フォールバックによるヒープ断片化の根本原因になっていた
+  // （NamazuHaUrokoGaNai docs/log/2026-08-11-batch-pool-fallback-heap-corruption.md）。
+  // RAMキューを毎回先に払うことで`ram_`を空/低占有に保ち、この詰まりを防ぐ。
+  // 代償として、大量backlog復旧中はspillの吐き出しが新規バッチに割り込まれ
+  // やすくなり遅くなる（データを失うわけではない、待ち順のトレードオフ）。
+  if (!ram_.empty()) {
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: ram branch, ram_.size()=%u t=%lld\n",
+                      (unsigned)ram_.size(), (long long)esp_timer_get_time());
+    Batch* b = ram_.front();
+    bool ok = postBatch(b->bytes(), b->size());
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: postBatch(ram) -> %d t=%lld\n", (int)ok,
+                      (long long)esp_timer_get_time());
+    if (ok) {
+      ram_.pop_front();
+      delete b;
+      backoffMs_ = 0;
+      nextAttemptMs_ = now;
+      return true;
+    }
+    backoffMs_ = backoffMs_ ? min(backoffMs_ * 2, kBackoffMaxMs) : kBackoffStartMs;
+    nextAttemptMs_ = now + backoffMs_;
+    return false;
+  }
+
+  // 2) 退避ファイル（常に古い）
   if (spillCount_ > 0) {
     UPLINK_DEBUG_LOG("[uplink-debug] pump: spill branch, spillCount=%u t=%lld\n",
                       (unsigned)spillCount_, (long long)esp_timer_get_time());
@@ -155,7 +199,11 @@ bool Uploader::pump() {
         size_t len = f.size();
         UPLINK_DEBUG_LOG("[uplink-debug] pump: opened %s len=%u t=%lld\n", path, (unsigned)len,
                           (long long)esp_timer_get_time());
-        uint8_t* body = (uint8_t*)malloc(len);
+        // 固定バッファ(begin()で確保済み)に収まるならそちらを使い、都度の
+        // malloc/freeを避ける（コンストラクタのmaxSpillReadBytesコメント参照）。
+        // 収まらない/未確保なら従来通り都度malloc()する。
+        bool usingFixedBuf = spillReadBuf_ && len <= maxSpillReadBytes_;
+        uint8_t* body = usingFixedBuf ? spillReadBuf_ : (uint8_t*)malloc(len);
         int readLen = body ? f.read(body, len) : -1;
         // ESP.getMaxAllocHeap()はMALLOC_CAP_INTERNAL基準でmalloc()の実際の基準
         // (MALLOC_CAP_8BIT)を過大報告することがある(NamazuHaUrokoGaNai PR #54で
@@ -171,7 +219,7 @@ bool Uploader::pump() {
           bool ok = postBatch(body, len);
           UPLINK_DEBUG_LOG("[uplink-debug] pump: postBatch(spill) -> %d t=%lld\n", (int)ok,
                             (long long)esp_timer_get_time());
-          free(body);
+          if (!usingFixedBuf) free(body);
           if (ok) {
             removeSpill(path);
             backoffMs_ = 0;
@@ -179,7 +227,7 @@ bool Uploader::pump() {
             return true;
           }
         } else {
-          if (body) free(body);
+          if (body && !usingFixedBuf) free(body);
           f.close();
         }
       } else {
@@ -191,26 +239,6 @@ bool Uploader::pump() {
                         (long long)esp_timer_get_time());
     }
     // 送れなかった -> バックオフ
-    backoffMs_ = backoffMs_ ? min(backoffMs_ * 2, kBackoffMaxMs) : kBackoffStartMs;
-    nextAttemptMs_ = now + backoffMs_;
-    return false;
-  }
-
-  // 2) RAMキューの古い順
-  if (!ram_.empty()) {
-    UPLINK_DEBUG_LOG("[uplink-debug] pump: ram branch, ram_.size()=%u t=%lld\n",
-                      (unsigned)ram_.size(), (long long)esp_timer_get_time());
-    Batch* b = ram_.front();
-    bool ok = postBatch(b->bytes(), b->size());
-    UPLINK_DEBUG_LOG("[uplink-debug] pump: postBatch(ram) -> %d t=%lld\n", (int)ok,
-                      (long long)esp_timer_get_time());
-    if (ok) {
-      ram_.pop_front();
-      delete b;
-      backoffMs_ = 0;
-      nextAttemptMs_ = now;
-      return true;
-    }
     backoffMs_ = backoffMs_ ? min(backoffMs_ * 2, kBackoffMaxMs) : kBackoffStartMs;
     nextAttemptMs_ = now + backoffMs_;
     return false;
