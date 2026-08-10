@@ -177,7 +177,11 @@ bool Uploader::pump() {
     UploaderLock lock(mutex_);
     ramFull = ram_.size() >= maxRam_;
   }
-  if (ramFull) flushToSpill();
+  if (ramFull) {
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: ram_ full (>=maxRam_), proactively flushing t=%lld\n",
+                      (long long)esp_timer_get_time());
+    flushToSpill();
+  }
 
   if (WiFi.status() != WL_CONNECTED) {
     UPLINK_DEBUG_LOG("[uplink-debug] pump: wifi not connected (status=%d) t=%lld\n",
@@ -455,6 +459,9 @@ bool Uploader::spillOldestRam() {
   ram_.pop_front();
   delete b;
   ++spillCount_;
+  UPLINK_DEBUG_LOG("[uplink-debug] spillOldestRam: wrote %s (%u bytes) ram=%u spill=%u t=%lld\n",
+                    path, (unsigned)w, (unsigned)ram_.size(), (unsigned)spillCount_,
+                    (long long)esp_timer_get_time());
   return true;
 }
 
