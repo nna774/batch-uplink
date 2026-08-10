@@ -16,7 +16,7 @@
 
 | | |
 |---|---|
-| `Batch` | 送信バッファ。`[ヘッダ領域][固定長レコード × N][tail]` の3領域だけを知る |
+| `Batch` | 送信バッファ。`[ヘッダ領域][固定長レコード × N][tail]` の3領域だけを知る。既定はmalloc/free。呼び出し側が用意した領域を借り、デストラクタでは`free()`せず`onRelease`コールバックを呼ぶだけの版もある（固定バッファプールを自前で持ちたい場合向け） |
 | `Uploader` | 送信キュー・LittleFS退避・指数バックオフ・バックフィル・HMAC署名POST。既定は退避先も一杯なら諦めて積む（データを捨てない）が、`dropOldestWhenFull=true` を渡すと満杯時に最古から捨てる。`oldestQueuedStartUs()` で最古の未送信バッチの開始時刻が取れる（呼び出し側で現在時刻と比べれば遅延表示に使える）。`watchResponseHeaders`（nullptr終端の配列）を渡すとバッチPOST成功時にそれらのレスポンスヘッダの値を保持し `lastResponseHeaderValue(name)` で読める（既定nullptrで従来通り何も読まない。本数の上限は無い。ヘッダの意味づけは呼び出し側の責務）。`extraRequestHeaderNames`（nullptr終端の配列）/`extraRequestHeaderValues`（同じ本数、終端不要）を渡すとバッチPOSTのたびにそれらのヘッダを付けて送る（既定nullptrで従来通り追加しない）。`flushToSpill()` はRAMキューを即座に全部LittleFSへ退避する（OTA更新など、この後RAMの内容が失われうる場面向け）。`caCert`（PEM文字列）を渡すとingest/alert接続のTLS検証に`setCACert()`を使う（既定nullptrでは従来通り`setInsecure()`にフォールバックするので、証明書を用意でき次第渡すのを推奨する） |
 | `HmacSha256` | 署名。ボディのバイト列にしか依存しない |
 | `TimeSync` | NTP(smooth同期。大きなずれは一度だけstep) |

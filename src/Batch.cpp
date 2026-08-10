@@ -15,7 +15,34 @@ Batch::Batch(uint32_t capacityRecords, size_t recordBytes, size_t headerBytes,
   if (buf_) std::memset(buf_, 0, headerBytes);
 }
 
-Batch::~Batch() { free(buf_); }
+Batch::Batch(uint8_t* buf, size_t bufSize, uint32_t capacityRecords, size_t recordBytes,
+             size_t headerBytes, size_t tailCapacity, ReleaseFn onRelease, void* releaseCtx)
+    : headerBytes_(headerBytes),
+      recordBytes_(recordBytes),
+      tailCapacity_(tailCapacity),
+      capacity_(capacityRecords),
+      onRelease_(onRelease),
+      releaseCtx_(releaseCtx) {
+  size_t need = headerBytes + static_cast<size_t>(capacityRecords) * recordBytes
+                + tailCapacity;
+  if (buf && bufSize >= need) {
+    buf_ = buf;
+    std::memset(buf_, 0, headerBytes);
+  } else if (buf && onRelease) {
+    // 領域が小さすぎて使えない場合も、所有権は最初から呼び出し側にあるので
+    // ここで突き返す。返し忘れるとプールのスロットが1つ消えたままになる。
+    onRelease(releaseCtx, buf);
+  }
+}
+
+Batch::~Batch() {
+  if (!buf_) return;
+  if (onRelease_) {
+    onRelease_(releaseCtx_, buf_);
+  } else {
+    free(buf_);
+  }
+}
 
 void Batch::begin(uint64_t startUs) {
   startUs_ = startUs;

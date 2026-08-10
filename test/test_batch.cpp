@@ -119,6 +119,41 @@ int main() {
     checkEq("size", (long)b.size(), 64 + 12);
   }
 
+  // --- 外部バッファ版: malloc/freeせず、デストラクタでonReleaseを呼ぶ ---
+  {
+    static int releaseCalls = 0;
+    static uint8_t* releasedBuf = nullptr;
+    releaseCalls = 0;
+    releasedBuf = nullptr;
+    auto onRelease = [](void* ctx, uint8_t* buf) {
+      ++releaseCalls;
+      releasedBuf = buf;
+      check("releaseCtxがそのまま渡る", ctx == reinterpret_cast<void*>(0x1234));
+    };
+    uint8_t pool[8 + 2 * 4 + 2];  // headerBytes + capacity*recordBytes + tailCapacity
+    {
+      Batch b(pool, sizeof(pool), 2, 4, 8, 2, onRelease, reinterpret_cast<void*>(0x1234));
+      check("外部バッファでもvalid", b.valid());
+      b.begin(9);
+      check("addRecord", b.addRecord("AAAA", 4));
+      check("bytes()はプールを指す", b.bytes() == pool);
+      checkEq("解放前はonRelease未呼び出し", releaseCalls, 0);
+    }
+    checkEq("スコープを抜けたらonReleaseが1回", releaseCalls, 1);
+    check("onReleaseに渡るのはプールの先頭", releasedBuf == pool);
+  }
+
+  // --- 外部バッファが小さすぎる場合: invalidになり、かつプールへ即座に返す ---
+  {
+    static int releaseCalls = 0;
+    releaseCalls = 0;
+    auto onRelease = [](void*, uint8_t*) { ++releaseCalls; };
+    uint8_t tooSmall[4];
+    Batch b(tooSmall, sizeof(tooSmall), 2, 4, 8, 2, onRelease, nullptr);
+    check("領域不足はinvalid", !b.valid());
+    checkEq("それでもonReleaseは呼ばれ、取りっぱぐれない", releaseCalls, 1);
+  }
+
   printf("\n%s (%d failure%s)\n", gFailures ? "FAILED" : "PASSED", gFailures,
          gFailures == 1 ? "" : "s");
   return gFailures ? 1 : 0;

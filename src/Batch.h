@@ -22,6 +22,16 @@ class Batch {
   // capacityRecords 件ぶんの領域を確保する。失敗時 valid()==false。
   Batch(uint32_t capacityRecords, size_t recordBytes, size_t headerBytes,
         size_t tailCapacity = 0);
+
+  // 呼び出し側が用意した領域(buf, 少なくとも headerBytes+capacityRecords*recordBytes
+  // +tailCapacity バイト)を借りる版。malloc/freeしない。デストラクタは
+  // onRelease(releaseCtx, buf) を呼ぶだけで、領域そのものの解放・再利用は
+  // 呼び出し側の責務（固定バッファプールへ返す、等）。渡された領域が小さすぎる場合
+  // valid()==false。onRelease は必須（nullptr不可、渡さないなら所有版を使うこと）。
+  using ReleaseFn = void (*)(void* ctx, uint8_t* buf);
+  Batch(uint8_t* buf, size_t bufSize, uint32_t capacityRecords, size_t recordBytes,
+        size_t headerBytes, size_t tailCapacity, ReleaseFn onRelease, void* releaseCtx);
+
   ~Batch();
 
   Batch(const Batch&) = delete;
@@ -69,4 +79,6 @@ class Batch {
   uint32_t capacity_ = 0;
   uint32_t count_ = 0;
   uint64_t startUs_ = 0;
+  ReleaseFn onRelease_ = nullptr;
+  void* releaseCtx_ = nullptr;
 };
