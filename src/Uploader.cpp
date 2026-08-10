@@ -53,6 +53,24 @@ static size_t countSentinelArray(const char* const* arr) {
   return n;
 }
 
+namespace {
+// mutex_のRAIIラッパー。スコープを抜けると必ず解放する（早期returnで解放し
+// 忘れるミスを防ぐ）。非再入——同じタスクが二重に取るとデッドロックするので、
+// ロック区間の中でロックを取る別のpublicメソッドを呼ばないこと。
+class UploaderLock {
+ public:
+  explicit UploaderLock(SemaphoreHandle_t sem) : sem_(sem) {
+    xSemaphoreTake(sem_, portMAX_DELAY);
+  }
+  ~UploaderLock() { xSemaphoreGive(sem_); }
+  UploaderLock(const UploaderLock&) = delete;
+  UploaderLock& operator=(const UploaderLock&) = delete;
+
+ private:
+  SemaphoreHandle_t sem_;
+};
+}  // namespace
+
 Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
                    uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
                    bool dropOldestWhenFull, const char* const* watchResponseHeaders,
@@ -72,6 +90,7 @@ Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmac
 
 Uploader::~Uploader() {
   free(spillReadBuf_);
+  if (mutex_) vSemaphoreDelete(mutex_);
 }
 
 bool Uploader::begin() {
@@ -113,6 +132,7 @@ void Uploader::enqueue(Batch* batch) {
     return;
   }
   static uint32_t sEnqueueCount = 0;
+  UploaderLock lock(mutex_);
   UPLINK_DEBUG_LOG(
       "[uplink-debug] enqueue #%u len=%u ram=%u spill=%u t=%lld\n",
       (unsigned)++sEnqueueCount, (unsigned)batch->size(), (unsigned)ram_.size(),
@@ -133,6 +153,36 @@ void Uploader::enqueue(Batch* batch) {
 }
 
 bool Uploader::pump() {
+  // ram_がmaxRam_に達している間は、待たずに毎回flushToSpill()を試みる。
+  //
+  // spillへの退避は本来enqueue()がRAM満杯を検知した時の副作用としてしか起きない
+  // 設計だが、送信が詰まったままRAMも満杯だと、呼び出し側(firmware)のBatch
+  // バッファプールも同時に枯渇し新しいバッチを作れなくなる。すると enqueue()
+  // が二度と呼ばれなくなり退避のトリガー自体が永遠に来ない飢餓状態に陥る
+  // ——実機のWiFi遮断試験で確認した(NamazuHaUrokoGaNai
+  // docs/log/2026-08-11-uploader-task-split-realhw-check.md)。
+  //
+  // 最初はこのチェックを「バックオフが上限(kBackoffMaxMs=60秒)に張り付いた
+  // 時だけ」にしていたが、遅すぎると判明した——プール枯渇中は呼び出し側の
+  // samplingTaskが生サンプルをその場で捨て続ける(Batchを組み立てられない
+  // ため)ので、60秒待つ設計では60秒ぶんの生波形データが継続的に欠測する。
+  // ram_.size()>=maxRam_はpump()の毎呼び出し(~50ms周期)で安価にチェックでき、
+  // かつ「これ以上RAMに置いておく意味がない(どうせ次のenqueue()で退避される
+  // 運命)」という状態を直接表す信号なので、これに差し替えた。
+  // WiFi接続状態に関わらず呼んでよい(flushToSpill()はLittleFSのみで完結する)。
+  // flushToSpill()自身が別途mutex_を取るため、ここではまずram_.size()だけを
+  // ロック内で読んでロックを手放してから呼ぶ(非再入mutexの二重取得を避ける)。
+  bool ramFull = false;
+  {
+    UploaderLock lock(mutex_);
+    ramFull = ram_.size() >= maxRam_;
+  }
+  if (ramFull) {
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: ram_ full (>=maxRam_), proactively flushing t=%lld\n",
+                      (long long)esp_timer_get_time());
+    flushToSpill();
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
     UPLINK_DEBUG_LOG("[uplink-debug] pump: wifi not connected (status=%d) t=%lld\n",
                       (int)WiFi.status(), (long long)esp_timer_get_time());
@@ -155,32 +205,61 @@ bool Uploader::pump() {
   // RAMキューを毎回先に払うことで`ram_`を空/低占有に保ち、この詰まりを防ぐ。
   // 代償として、大量backlog復旧中はspillの吐き出しが新規バッチに割り込まれ
   // やすくなり遅くなる（データを失うわけではない、待ち順のトレードオフ）。
-  if (!ram_.empty()) {
-    UPLINK_DEBUG_LOG("[uplink-debug] pump: ram branch, ram_.size()=%u t=%lld\n",
-                      (unsigned)ram_.size(), (long long)esp_timer_get_time());
-    Batch* b = ram_.front();
-    bool ok = postBatch(b->bytes(), b->size());
+  //
+  // ram_からの取り出しは「popしてから送る」（front()を覗いたまま送るのでは
+  // ない）。覗いたまま送ると、送信中（postBatch()はロック外・数秒〜数十秒
+  // かかりうる）にもう一方のタスクのenqueue()がRAM満杯を検知して同じ先頭要素を
+  // spillOldestRam()で退避・deleteしてしまう競合windowができる
+  // （NamazuHaUrokoGaNai docs/log/2026-08-11-uploader-task-split-design.md）。
+  // popして所有権をローカルへ移しておけば、送信中はram_から見えなくなるので
+  // enqueue()側のオーバーフロー処理と衝突しない。失敗時はpush_front()で戻す。
+  Batch* ramBatch = nullptr;
+  {
+    UploaderLock lock(mutex_);
+    if (!ram_.empty()) {
+      ramBatch = ram_.front();
+      ram_.pop_front();
+    }
+  }
+  if (ramBatch) {
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: ram branch t=%lld\n",
+                      (long long)esp_timer_get_time());
+    bool ok = postBatch(ramBatch->bytes(), ramBatch->size());
     UPLINK_DEBUG_LOG("[uplink-debug] pump: postBatch(ram) -> %d t=%lld\n", (int)ok,
                       (long long)esp_timer_get_time());
     if (ok) {
-      ram_.pop_front();
-      delete b;
+      delete ramBatch;
       backoffMs_ = 0;
       nextAttemptMs_ = now;
       return true;
+    }
+    {
+      UploaderLock lock(mutex_);
+      ram_.push_front(ramBatch);
     }
     backoffMs_ = backoffMs_ ? min(backoffMs_ * 2, kBackoffMaxMs) : kBackoffStartMs;
     nextAttemptMs_ = now + backoffMs_;
     return false;
   }
 
-  // 2) 退避ファイル（常に古い）
-  if (spillCount_ > 0) {
-    UPLINK_DEBUG_LOG("[uplink-debug] pump: spill branch, spillCount=%u t=%lld\n",
-                      (unsigned)spillCount_, (long long)esp_timer_get_time());
-    char path[64];
-    uint64_t startUs;
-    if (loadOldestSpillPath(path, sizeof(path), startUs)) {
+  // 2) 退避ファイル（常に古い）。パスの決定・オープン・読み込みまでを
+  // 1回のロックでまとめて行い、「pump()がパスを決めた直後にenqueue()側の
+  // evictOldestSpill()が同じファイルを消す」隙間を作らない。
+  char path[64] = {0};
+  uint64_t startUs;
+  uint8_t* body = nullptr;
+  size_t len = 0;
+  bool usingFixedBuf = false;
+  bool readOk = false;
+  {
+    UploaderLock lock(mutex_);
+    if (spillCount_ > 0 && loadOldestSpillPath(path, sizeof(path), startUs)) {
+      // spillCount_>0なのにloadOldestSpillPath()が見つけられない場合だけを
+      // 「FAILED」とログしたい（spillCount_==0で退避ファイルが単に無い、という
+      // 普段の状態と、カウンタと実ファイルがズレている異常を混同しないため）。
+      // &&の短絡評価に頼って両者を1本のログにまとめると、平常時(spillCount_==0)
+      // 毎回「FAILED」が出て紛らわしくなる——実際に踏んだ(pump()が空振りする
+      // たびに出続けていた)ので、下のelse節で明示的に分けた。
       UPLINK_DEBUG_LOG("[uplink-debug] pump: loadOldestSpillPath -> %s t=%lld\n", path,
                         (long long)esp_timer_get_time());
       // LittleFS.open()はArduino-ESP32のFS実装内部でstd::make_shared<VFSFileImpl>を
@@ -197,15 +276,16 @@ bool Uploader::pump() {
                       (long long)esp_timer_get_time());
       }
       if (f) {
-        size_t len = f.size();
+        len = f.size();
         UPLINK_DEBUG_LOG("[uplink-debug] pump: opened %s len=%u t=%lld\n", path, (unsigned)len,
                           (long long)esp_timer_get_time());
         // 固定バッファ(begin()で確保済み)に収まるならそちらを使い、都度の
         // malloc/freeを避ける（コンストラクタのmaxSpillReadBytesコメント参照）。
         // 収まらない/未確保なら従来通り都度malloc()する。
-        bool usingFixedBuf = spillReadBuf_ && len <= maxSpillReadBytes_;
-        uint8_t* body = usingFixedBuf ? spillReadBuf_ : (uint8_t*)malloc(len);
+        usingFixedBuf = spillReadBuf_ && len <= maxSpillReadBytes_;
+        body = usingFixedBuf ? spillReadBuf_ : (uint8_t*)malloc(len);
         int readLen = body ? f.read(body, len) : -1;
+        f.close();
         // ESP.getMaxAllocHeap()はMALLOC_CAP_INTERNAL基準でmalloc()の実際の基準
         // (MALLOC_CAP_8BIT)を過大報告することがある(NamazuHaUrokoGaNai PR #54で
         // 実測済み)。ここのmalloc()失敗の原因切り分けには8BIT側の実測値が要る。
@@ -215,57 +295,68 @@ bool Uploader::pump() {
             readLen, (void*)body, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
             (long long)esp_timer_get_time());
-        if (body && readLen == (int)len) {
-          f.close();
-          bool ok = postBatch(body, len);
-          UPLINK_DEBUG_LOG("[uplink-debug] pump: postBatch(spill) -> %d t=%lld\n", (int)ok,
-                            (long long)esp_timer_get_time());
-          if (!usingFixedBuf) free(body);
-          if (ok) {
-            removeSpill(path);
-            backoffMs_ = 0;
-            nextAttemptMs_ = now;
-            return true;
-          }
-          // ingestが「このボディは壊れている」とHTTP 400で明確に判定した場合に
-          // 限り、この退避ファイルは何度リトライしても成功しないとみなして
-          // 諦める（Uploader.h冒頭コメント「不変条件 例外2」）。403やコード無しの
-          // 接続失敗はここに来ない(lastPostCode_はHTTP応答が実際に返った時だけ
-          // 更新される)ので、それらは従来通り下のバックオフへ流れて再試行される。
-          if (discardSpillOn400_ && lastPostCode_ == 400) {
-            Serial.printf(
-                "[uploader] spill %s rejected with HTTP 400 (malformed body, discarding) "
-                "t=%lld\n",
-                path, (long long)esp_timer_get_time());
-            removeSpill(path);
-            backoffMs_ = 0;
-            nextAttemptMs_ = now;
-            return false;
-          }
-        } else {
-          if (body && !usingFixedBuf) free(body);
-          f.close();
+        readOk = body && readLen == (int)len;
+        if (!readOk && body && !usingFixedBuf) {
+          free(body);
+          body = nullptr;
         }
       } else {
         UPLINK_DEBUG_LOG("[uplink-debug] pump: LittleFS.open(%s) FAILED t=%lld\n", path,
                           (long long)esp_timer_get_time());
       }
-    } else {
-      UPLINK_DEBUG_LOG("[uplink-debug] pump: loadOldestSpillPath FAILED t=%lld\n",
-                        (long long)esp_timer_get_time());
+    } else if (spillCount_ > 0) {
+      // spillCount_はある(>0)のに実ファイルが見つからない——カウンタと実体が
+      // ズレている異常なので、平常時の「spillが単に空」と区別してログする。
+      UPLINK_DEBUG_LOG("[uplink-debug] pump: loadOldestSpillPath FAILED (spillCount_=%u) t=%lld\n",
+                        (unsigned)spillCount_, (long long)esp_timer_get_time());
     }
-    // 送れなかった -> バックオフ
+    // spillCount_==0の場合はここで何もログしない(退避ファイルが単に無いだけの
+    // 平常状態、pump()呼び出しのたびに出ると紛らわしい)。
+  }
+  if (path[0] == '\0') {
+    // 送るものが無い: 使い回していた接続を明示的に閉じる。繋ぎっぱなしにすると
+    // 次にバッチが来るまでTLSセッション分のRAMを無駄に予約し続けてしまう
+    // （使い回しの狙いはバックフィルの連続POST中のハンドシェイク省略であって、
+    // 常時接続の維持ではない）。
+    UPLINK_DEBUG_LOG("[uplink-debug] pump: nothing to send, closing idle connection t=%lld\n",
+                      (long long)esp_timer_get_time());
+    closeConnection();
+    return false;
+  }
+  if (!readOk) {
+    // パスは決まったが開けなかった/読めなかった -> バックオフ
     backoffMs_ = backoffMs_ ? min(backoffMs_ * 2, kBackoffMaxMs) : kBackoffStartMs;
     nextAttemptMs_ = now + backoffMs_;
     return false;
   }
-  // 送るものが無い: 使い回していた接続を明示的に閉じる。繋ぎっぱなしにすると
-  // 次にバッチが来るまでTLSセッション分のRAMを無駄に予約し続けてしまう
-  // （使い回しの狙いはバックフィルの連続POST中のハンドシェイク省略であって、
-  // 常時接続の維持ではない）。
-  UPLINK_DEBUG_LOG("[uplink-debug] pump: nothing to send, closing idle connection t=%lld\n",
+  bool ok = postBatch(body, len);
+  UPLINK_DEBUG_LOG("[uplink-debug] pump: postBatch(spill) -> %d t=%lld\n", (int)ok,
                     (long long)esp_timer_get_time());
-  closeConnection();
+  if (!usingFixedBuf) free(body);
+  if (ok) {
+    UploaderLock lock(mutex_);
+    removeSpill(path);
+    backoffMs_ = 0;
+    nextAttemptMs_ = now;
+    return true;
+  }
+  // ingestが「このボディは壊れている」とHTTP 400で明確に判定した場合に限り、
+  // この退避ファイルは何度リトライしても成功しないとみなして諦める
+  // （Uploader.h冒頭コメント「不変条件 例外2」）。403やコード無しの接続失敗は
+  // ここに来ない(lastPostCode_はHTTP応答が実際に返った時だけ更新される)ので、
+  // それらは従来通り下のバックオフへ流れて再試行される。
+  if (discardSpillOn400_ && lastPostCode_ == 400) {
+    Serial.printf(
+        "[uploader] spill %s rejected with HTTP 400 (malformed body, discarding) t=%lld\n", path,
+        (long long)esp_timer_get_time());
+    UploaderLock lock(mutex_);
+    removeSpill(path);
+    backoffMs_ = 0;
+    nextAttemptMs_ = now;
+    return false;
+  }
+  backoffMs_ = backoffMs_ ? min(backoffMs_ * 2, kBackoffMaxMs) : kBackoffStartMs;
+  nextAttemptMs_ = now + backoffMs_;
   return false;
 }
 
@@ -368,16 +459,35 @@ bool Uploader::spillOldestRam() {
   ram_.pop_front();
   delete b;
   ++spillCount_;
+  UPLINK_DEBUG_LOG("[uplink-debug] spillOldestRam: wrote %s (%u bytes) ram=%u spill=%u t=%lld\n",
+                    path, (unsigned)w, (unsigned)ram_.size(), (unsigned)spillCount_,
+                    (long long)esp_timer_get_time());
   return true;
 }
 
 size_t Uploader::flushToSpill() {
+  UploaderLock lock(mutex_);
   size_t n = 0;
   while (!ram_.empty()) {
     if (!spillOldestRam()) break;
     ++n;
   }
   return n;
+}
+
+size_t Uploader::ramQueued() const {
+  UploaderLock lock(mutex_);
+  return ram_.size();
+}
+
+size_t Uploader::spillCount() const {
+  UploaderLock lock(mutex_);
+  return spillCount_;
+}
+
+size_t Uploader::droppedCount() const {
+  UploaderLock lock(mutex_);
+  return droppedCount_;
 }
 
 String Uploader::lastResponseHeaderValue(const char* headerName) const {
@@ -388,6 +498,7 @@ String Uploader::lastResponseHeaderValue(const char* headerName) const {
 }
 
 bool Uploader::oldestQueuedStartUs(uint64_t& outStartUs) const {
+  UploaderLock lock(mutex_);
   if (spillCount_ > 0) {
     char path[64];
     return loadOldestSpillPath(path, sizeof(path), outStartUs);
