@@ -17,10 +17,23 @@
 // 「電源断等でLittleFSに0バイト/途中で切れた退避ファイルができ、それが
 // 永遠に先頭に居座ってキュー全体が詰まる」実機バグへの対処）。既定は false
 // （呼び出し側が明示的に選ばない限り不変条件は変わらない）。
+//
+// スレッド安全性: enqueue()（受け取り側）とpump()（送信側）を別タスクから
+// 同時に呼ぶ用途を想定し、内部にミューテックスを持つ（NamazuHaUrokoGaNai
+// docs/log/2026-08-11-uploader-task-split.md、firmwareのuploaderTaskを
+// 「吸い出し」「送信」の2タスクに割る変更に対応）。ロックは`ram_`・spillの
+// LittleFS操作を囲むだけで、pump()内のネットワークI/O（postBatch()）区間は
+// 保持しない——ここを握ったままだと、TLSハンドシェイクが詰まった時に吸い出し側の
+// enqueue()まで巻き込んで長時間ブロックし、本末転倒になる（分離した意味が消える）。
+// 呼び出し側が複数タスクに分かれない従来の使い方（1タスクが全部呼ぶ）でも、
+// ロック自体は無害（競合しないので待たない）なのでそのまま動く。
 
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include <deque>
 #include <vector>
@@ -97,8 +110,8 @@ class Uploader {
   // 中身をここに置くと、この層が地震計専用になり他プロジェクトと共有できない）。
   bool sendAlert(const char* json, size_t len);
 
-  size_t ramQueued() const { return ram_.size(); }
-  size_t spillCount() const { return spillCount_; }
+  size_t ramQueued() const;
+  size_t spillCount() const;
 
   // キュー中で最も古いバッチの開始時刻[us]（送信順序と同じ基準：退避ファイル優先、
   // 無ければRAMキューの先頭）。キューが空なら false。表示で「どれだけ遅れているか」
@@ -107,7 +120,7 @@ class Uploader {
 
   // dropOldestWhenFull=true の時、満杯で捨てた本数の累計。
   // 既定(false)では常に0のまま（捨てないので増えようがない）。
-  size_t droppedCount() const { return droppedCount_; }
+  size_t droppedCount() const;
 
   // RAMキューにある分を全てLittleFSへ退避する。戻り値は退避できた本数。
   // OTA更新など「この後の処理でRAMの内容が失われうる」場面で、再起動前に
@@ -131,7 +144,16 @@ class Uploader {
   void closeConnection();
 
  private:
+  // postBatch()はclient_/http_/lastPostCode_/lastResponseHeaderValues_だけを触る。
+  // これらは送信タスク（pump()を呼ぶ側）だけがアクセスする前提のフィールドで
+  // ram_/spillと違い複数タスクから触られないため、ロック不要（意図的にmutex_の
+  // 外で呼ぶ——ネットワークI/Oをロック区間に含めないため。Uploader.h冒頭の
+  // スレッド安全性コメント参照）。
   bool postBatch(const uint8_t* body, size_t len);
+
+  // 以下はram_またはLittleFSのspillディレクトリを直接操作する。呼び出し元が
+  // 既にmutex_を保持している前提で書いてある（内部で改めてロックを取らない）。
+  // 公開メソッド以外から直接呼ばないこと——lockなしで呼ぶと排他が効かない。
   bool spillOldestRam();               // RAM先頭をファイルへ
   bool loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs) const;
   void removeSpill(const char* path);
@@ -151,6 +173,12 @@ class Uploader {
   size_t extraRequestHeaderCount_;
   const char* caCert_;
   bool discardSpillOn400_;
+
+  // ram_・spillCount_・LittleFSのspillディレクトリへのアクセスを排他する。
+  // enqueue()（吸い出しタスク）とpump()/flushToSpill()（送信タスク）が別タスクから
+  // 同時にこれらを触りうるための保護。取る場所は各メソッドの実装（Uploader.cpp）を
+  // 参照——postBatch()のネットワークI/O区間だけは意図的に対象外にしてある。
+  SemaphoreHandle_t mutex_ = xSemaphoreCreateMutex();
 
   std::deque<Batch*> ram_;
   size_t spillCount_ = 0;
