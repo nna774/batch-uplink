@@ -96,13 +96,21 @@ class Uploader {
   // POSTが失敗した回は更新しない（前回成功時の値を保持）。
   String lastResponseHeaderValue(const char* headerName) const;
 
+  // ingest向けの使い回し接続(client_)を明示的に閉じる。pump()は送るものが
+  // 無くなった時に自発的にこれを呼ぶが、呼び出し側が「この直後に別のTLS接続を
+  // 張る」と分かっている場面（OTA取得の直前など）では、その自発呼び出しを
+  // 待たずここで先に閉じておく必要がある——mbedTLSの確保/解放を単一の固定プールへ
+  // 隔離する構成（呼び出し側の実装依存。TlsMemPool等）を使っている場合、2本の
+  // TLS接続が同時に生きるとプールが単一接続分のサイズ見積もりを超えうるため。
+  // 接続が無ければ何もしない。
+  void closeConnection();
+
  private:
   bool postBatch(const uint8_t* body, size_t len);
   bool spillOldestRam();               // RAM先頭をファイルへ
   bool loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs) const;
   void removeSpill(const char* path);
   bool evictOldestSpill();             // 退避ファイルの最古を1本消す（空きを作る）
-  void closeIdleConnection();          // 送るものが無くなった時にingest向け接続を明示的に閉じる
 
   const char* ingestUrl_;
   const char* alertUrl_;
