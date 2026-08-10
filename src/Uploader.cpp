@@ -221,7 +221,7 @@ bool Uploader::pump() {
   // 常時接続の維持ではない）。
   UPLINK_DEBUG_LOG("[uplink-debug] pump: nothing to send, closing idle connection t=%lld\n",
                     (long long)esp_timer_get_time());
-  closeIdleConnection();
+  closeConnection();
   return false;
 }
 
@@ -278,7 +278,7 @@ bool Uploader::postBatch(const uint8_t* body, size_t len) {
   return ok;
 }
 
-void Uploader::closeIdleConnection() {
+void Uploader::closeConnection() {
   if (client_.connected()) client_.stop();
 }
 
