@@ -5,6 +5,8 @@
 #include <LittleFS.h>
 #include <WiFiClientSecure.h>
 
+#include <esp_heap_caps.h>
+
 #include <cstdio>
 #include <cstring>
 
@@ -155,9 +157,14 @@ bool Uploader::pump() {
                           (long long)esp_timer_get_time());
         uint8_t* body = (uint8_t*)malloc(len);
         int readLen = body ? f.read(body, len) : -1;
+        // ESP.getMaxAllocHeap()はMALLOC_CAP_INTERNAL基準でmalloc()の実際の基準
+        // (MALLOC_CAP_8BIT)を過大報告することがある(NamazuHaUrokoGaNai PR #54で
+        // 実測済み)。ここのmalloc()失敗の原因切り分けには8BIT側の実測値が要る。
         UPLINK_DEBUG_LOG(
-            "[uplink-debug] pump: read -> %d (body=%p) heap_free=%u maxblock=%u t=%lld\n",
+            "[uplink-debug] pump: read -> %d (body=%p) heap_free=%u "
+            "maxblock_internal=%u maxblock_8bit=%u t=%lld\n",
             readLen, (void*)body, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
             (long long)esp_timer_get_time());
         if (body && readLen == (int)len) {
           f.close();
