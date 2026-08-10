@@ -4,9 +4,18 @@
 // 不変条件: 「2xx が返るまでバッチを捨てない」。失敗理由は区別しない。
 // 送信順序: LittleFSの退避ファイル（常に古い）を先に、次にRAMキューの古い順。
 //
-// 例外: dropOldestWhenFull=true の時だけ、LittleFSも一杯でこれ以上退避できない
+// 例外1: dropOldestWhenFull=true の時だけ、LittleFSも一杯でこれ以上退避できない
 // 場面に限り、一番古いデータ（退避ファイルの最古、無ければRAMキューの先頭）を
 // 捨てて新しいデータを残す。既定は false でこの例外は発動しない
+// （呼び出し側が明示的に選ばない限り不変条件は変わらない）。
+//
+// 例外2: discardSpillOn400=true の時だけ、退避ファイルのPOSTがHTTP応答コード
+// ちょうど400（サーバが「このボディは壊れている」と明確に判定した場合のみ。
+// 403やタイムアウト・切断等コード無しの失敗は含まない）で拒否されたら、その
+// 退避ファイルは何度リトライしても成功しないとみなして即座に捨てる
+// （NamazuHaUrokoGaNai docs/log/2026-08-11-spill-quarantine-on-400.md
+// 「電源断等でLittleFSに0バイト/途中で切れた退避ファイルができ、それが
+// 永遠に先頭に居座ってキュー全体が詰まる」実機バグへの対処）。既定は false
 // （呼び出し側が明示的に選ばない限り不変条件は変わらない）。
 
 #include <Arduino.h>
@@ -59,13 +68,16 @@ class Uploader {
   // 指定サイズを超える退避ファイルは読めない(0扱いでスキップ)——呼び出し側は
   // 送るバッチの最大サイズ以上を渡すこと。begin()でのmalloc失敗時は従来の
   // 都度malloc/free経路へ安全に縮退する。
+  //
+  // discardSpillOn400: ファイル冒頭の「不変条件」例外2を参照。既定false。
   Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
            uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
            bool dropOldestWhenFull = false,
            const char* const* watchResponseHeaders = nullptr,
            const char* const* extraRequestHeaderNames = nullptr,
            const char* const* extraRequestHeaderValues = nullptr,
-           const char* caCert = nullptr, size_t maxSpillReadBytes = 0);
+           const char* caCert = nullptr, size_t maxSpillReadBytes = 0,
+           bool discardSpillOn400 = false);
 
   ~Uploader();
 
@@ -138,6 +150,7 @@ class Uploader {
   const char* const* extraRequestHeaderValues_;
   size_t extraRequestHeaderCount_;
   const char* caCert_;
+  bool discardSpillOn400_;
 
   std::deque<Batch*> ram_;
   size_t spillCount_ = 0;
@@ -145,6 +158,10 @@ class Uploader {
   std::vector<String> lastResponseHeaderValues_;
   uint32_t backoffMs_ = 0;
   uint32_t nextAttemptMs_ = 0;
+
+  // postBatch()の直近呼び出しのHTTP応答コード（未応答/接続失敗等は0のまま）。
+  // discardSpillOn400_の判定にだけ使う内部状態。
+  int lastPostCode_ = 0;
 
   // 退避ファイル読み込み用の固定バッファ（begin()で一度だけmalloc()。
   // 未指定/malloc失敗時はspillReadBuf_==nullptrのまま、pump()は従来の

@@ -58,7 +58,7 @@ Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmac
                    bool dropOldestWhenFull, const char* const* watchResponseHeaders,
                    const char* const* extraRequestHeaderNames,
                    const char* const* extraRequestHeaderValues, const char* caCert,
-                   size_t maxSpillReadBytes)
+                   size_t maxSpillReadBytes, bool discardSpillOn400)
     : ingestUrl_(ingestUrl), alertUrl_(alertUrl), hmacSecret_(hmacSecret),
       deviceId_(deviceId), maxRam_(maxRamBatches), spillDir_(spillDir),
       dropOldestWhenFull_(dropOldestWhenFull), watchResponseHeaders_(watchResponseHeaders),
@@ -66,7 +66,8 @@ Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmac
       extraRequestHeaderNames_(extraRequestHeaderNames),
       extraRequestHeaderValues_(extraRequestHeaderValues),
       extraRequestHeaderCount_(countSentinelArray(extraRequestHeaderNames)),
-      caCert_(caCert), lastResponseHeaderValues_(watchResponseHeaderCount_),
+      caCert_(caCert), discardSpillOn400_(discardSpillOn400),
+      lastResponseHeaderValues_(watchResponseHeaderCount_),
       maxSpillReadBytes_(maxSpillReadBytes) {}
 
 Uploader::~Uploader() {
@@ -226,6 +227,21 @@ bool Uploader::pump() {
             nextAttemptMs_ = now;
             return true;
           }
+          // ingestが「このボディは壊れている」とHTTP 400で明確に判定した場合に
+          // 限り、この退避ファイルは何度リトライしても成功しないとみなして
+          // 諦める（Uploader.h冒頭コメント「不変条件 例外2」）。403やコード無しの
+          // 接続失敗はここに来ない(lastPostCode_はHTTP応答が実際に返った時だけ
+          // 更新される)ので、それらは従来通り下のバックオフへ流れて再試行される。
+          if (discardSpillOn400_ && lastPostCode_ == 400) {
+            Serial.printf(
+                "[uploader] spill %s rejected with HTTP 400 (malformed body, discarding) "
+                "t=%lld\n",
+                path, (long long)esp_timer_get_time());
+            removeSpill(path);
+            backoffMs_ = 0;
+            nextAttemptMs_ = now;
+            return false;
+          }
         } else {
           if (body && !usingFixedBuf) free(body);
           f.close();
@@ -285,6 +301,10 @@ bool Uploader::postBatch(const uint8_t* body, size_t len) {
   int code = http_.POST(const_cast<uint8_t*>(body), len);
   UPLINK_DEBUG_LOG("[uplink-debug] http_.POST() -> code=%d t=%lld\n", code,
                     (long long)esp_timer_get_time());
+  // HTTPClientは接続確立自体に失敗すると負値(HTTPC_ERROR_*)を返す。実際に
+  // サーバから応答コードが返った時だけここに載るので、discardSpillOn400_の
+  // 「サーバが明確に拒否した」判定はこの区別に乗っかれる。
+  lastPostCode_ = code;
   bool ok = (code >= 200 && code < 300);
   if (ok) {
     for (size_t i = 0; i < watchResponseHeaderCount_; ++i) {
