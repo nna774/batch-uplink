@@ -155,8 +155,10 @@ bool Uploader::pump() {
                           (long long)esp_timer_get_time());
         uint8_t* body = (uint8_t*)malloc(len);
         int readLen = body ? f.read(body, len) : -1;
-        UPLINK_DEBUG_LOG("[uplink-debug] pump: read -> %d (body=%p) t=%lld\n", readLen,
-                          (void*)body, (long long)esp_timer_get_time());
+        UPLINK_DEBUG_LOG(
+            "[uplink-debug] pump: read -> %d (body=%p) heap_free=%u maxblock=%u t=%lld\n",
+            readLen, (void*)body, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+            (long long)esp_timer_get_time());
         if (body && readLen == (int)len) {
           f.close();
           bool ok = postBatch(body, len);
