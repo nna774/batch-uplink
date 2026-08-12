@@ -9,6 +9,12 @@ firmware はWiFi断のあとバックフィルするので、測定時刻(last_b
 「復旧直後で追いつき中」と「本当に沈黙」が区別できない。受信壁時計で生存を、
 last_batch_start_us との差でデータ遅延を、別々に見る。
 
+last_batch_start_us は単調増加（条件付き更新で巻き戻りを拒否）。送信側がRAM
+キュー（最新）を優先し退避ファイル（古い）を後回しにする実装（v2.11.0）のため、
+バックフィル中は新旧のバッチが交互に届く。ここが無条件上書きだと、退避ファイル
+受信のたびにこの値が過去へ戻り、遅延判定(evaluate_lag)とダッシュボードの
+「データ鮮度」表示の両方が誤って暴れる。
+
 欠測通知の状態(offline_notified_at_us)とデータ遅延通知の状態(lag_notified_at_us)は
 watchdog だけが書く。ingest が書く受信系フィールドとは互いに素なので、両者を
 UpdateItem で分けて更新すれば read-modify-write の競合は起きない。
@@ -24,6 +30,7 @@ import os
 from decimal import Decimal
 
 import boto3
+from botocore.exceptions import ClientError
 
 _table_cache = None
 
@@ -45,8 +52,7 @@ def record_batch(device_id: int, batch_start_us: int, ingest_at_us: int,
 
     - last_ingest_at_us  : 受信壁時計。生存の主信号。常に前進（値は常に "今"）。
     - last_batch_start_us: 受け取ったバッチの測定開始時刻。データの新しさの目安。
-      通常は順送りなので単調増加。バックフィル中は一時的に巻き戻り得るが、
-      これは表示上の「データ鮮度」であって生存判定には使わないので許容する。
+      条件付き更新で単調増加を強制する（下記）。
     - batches_total      : 累積受信数。
     - fw_version         : 呼び出し側がリクエストヘッダ等から読んだ、送信元が
       いま動かしているビルド版数（空文字なら書かない。ヘッダを送らない
@@ -54,12 +60,10 @@ def record_batch(device_id: int, batch_start_us: int, ingest_at_us: int,
     """
     set_parts = [
         "last_ingest_at_us = :now",
-        "last_batch_start_us = :bs",
         "last_batch_key = :key",
     ]
     values = {
         ":now": _dec(ingest_at_us),
-        ":bs": _dec(batch_start_us),
         ":key": last_batch_key,
         ":one": Decimal(1),
     }
@@ -71,6 +75,22 @@ def record_batch(device_id: int, batch_start_us: int, ingest_at_us: int,
         UpdateExpression="SET " + ", ".join(set_parts) + " ADD batches_total :one",
         ExpressionAttributeValues=values,
     )
+    # last_batch_start_us は別のUpdateItemで条件付き更新する。上のSETに混ぜて
+    # 全体をConditionExpressionで守ると、退避ファイル（古いバッチ）受信時に
+    # last_ingest_at_us・batches_totalまで一緒に更新拒否されてしまう
+    # （生存台帳が受信を見逃した扱いになる）ため、必ず分ける。
+    try:
+        _table().update_item(
+            Key={"device_id": device_id},
+            UpdateExpression="SET last_batch_start_us = :bs",
+            ConditionExpression=(
+                "attribute_not_exists(last_batch_start_us) OR last_batch_start_us < :bs"
+            ),
+            ExpressionAttributeValues={":bs": _dec(batch_start_us)},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
 
 
 def get_device(device_id: int) -> dict | None:
