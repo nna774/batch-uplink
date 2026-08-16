@@ -30,7 +30,6 @@
 | `auth` | HMAC-SHA256 検証。`NAMZ_HMAC_SECRET_<id>` で個体別鍵 |
 | `devices` | デバイス生存台帳（DynamoDB）。受信壁時計で生存を、測定時刻との差で遅延を見る |
 | `notify` | 通知層（Slack Incoming Webhook / Null。差し替え可能） |
-| `s3util` | S3キー組み立て。**20桁ゼロ埋めで辞書順＝時系列順**になる命名 |
 
 **stdlib + boto3 のみ**。numpy に依存しないので platform wheel の問題が起きない。
 
@@ -69,10 +68,10 @@ pip install "git+https://github.com/nna774/batch-uplink@v1.0.0"
 ```
 
 ```python
-from batch_uplink import auth, devices, notify, s3util
+from batch_uplink import auth, devices, notify
 
 auth.verify(device_id, body, signature_hex)
-key = s3util.raw_key(device_id, batch_start_us)
+key = ...  # S3キーの組み立ては呼び出し側で行う（保存先prefix・寿命はプロジェクトごとに違うため）
 devices.record_batch(device_id, batch_start_us, ingest_at_us, key)
 notify.from_env().notify("title", "text")
 ```
