@@ -47,7 +47,8 @@ def _dec(v) -> Decimal:
 
 
 def record_batch(device_id: int, batch_start_us: int, ingest_at_us: int,
-                 last_batch_key: str = "", fw_version: str = "") -> None:
+                 last_batch_key: str = "", fw_version: str = "",
+                 track_prev_key: bool = False) -> None:
     """バッチ受信を台帳に反映（upsert）。ingest から毎バッチ呼ぶ。
 
     - last_ingest_at_us  : 受信壁時計。生存の主信号。常に前進（値は常に "今"）。
@@ -57,6 +58,14 @@ def record_batch(device_id: int, batch_start_us: int, ingest_at_us: int,
     - fw_version         : 呼び出し側がリクエストヘッダ等から読んだ、送信元が
       いま動かしているビルド版数（空文字なら書かない。ヘッダを送らない
       呼び出し側や未対応の旧ファームとの互換のため）。
+    - track_prev_key     : Trueなら、上書き前の`last_batch_key`を`prev_batch_key`へ
+      退避してから`last_batch_key`を新値で上書きする。DynamoDBの`UpdateExpression`は
+      同一呼び出し内のSET節の右辺が全て更新前の値を参照するため、追加のGetItem無しに
+      アトミックに「1つ前のバッチキー」を残せる。呼び出し側がバッチ境界をまたぐ
+      連続性のために直前バッチを引きたい用途向け（Electabuzz detect固有の要件。
+      Namazuは使わないのでデフォルトFalse——常時書くと使わない側の属性が増えるだけ）。
+      台帳が無い(初回)場合は`last_batch_key`属性自体が無く参照できないので、
+      `if_not_exists`で空文字にフォールバックする（「直前バッチ無し」を正しく表す）。
     """
     set_parts = [
         "last_ingest_at_us = :now",
@@ -67,6 +76,9 @@ def record_batch(device_id: int, batch_start_us: int, ingest_at_us: int,
         ":key": last_batch_key,
         ":one": Decimal(1),
     }
+    if track_prev_key:
+        set_parts.append("prev_batch_key = if_not_exists(last_batch_key, :empty)")
+        values[":empty"] = ""
     if fw_version:
         set_parts.append("fw_version = :fw")
         values[":fw"] = fw_version
