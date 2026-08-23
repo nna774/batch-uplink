@@ -109,6 +109,50 @@ def get_device(device_id: int) -> dict | None:
     return _table().get_item(Key={"device_id": device_id}).get("Item")
 
 
+def record_batch_fragments(item: dict | None, batch_start_us: int, ingest_at_us: int,
+                           last_batch_key: str = "", fw_version: str = "") -> list[tuple[str, dict]]:
+    """record_batch()と同じ書き込み内容を、実行せず断片のリストとして返す。
+
+    呼び出し側が他の関心事（自前のローカル属性等）と合流させて1回のupdate_itemに
+    まとめたい場合向け。record_batch()自身は「毎バッチ即executeする」関数のままなので、
+    こちらは別関数として追加した（既存の呼び出し元・track_prev_keyを使う呼び出し元は
+    record_batch()を変更なく使い続けられる）。
+
+    record_batch()はlast_batch_start_usの単調増加をConditionExpressionで守る
+    （そのため内部でupdate_itemを2回に分けている）。こちらは呼び出し側が既に
+    GetItemで取得済みの現在の項目を`item`（未登録デバイスならNone）として受け取り、
+    その場でPython側で比較することで、追加のDynamoDB呼び出し無しに単調性を保つ。
+    ConditionExpressionによる「同時に来た書き込み同士のアトミック性」までは
+    提供しない——呼び出し元が既にGetItemしている前提であり、そのGetItemと
+    このupdate_itemの間に他の書き込みが割り込む可能性を許容できる場合にのみ使うこと
+    （デバイス1台からのリクエストが事実上直列な用途を想定）。
+
+    track_prev_keyは持たない（Electabuzz detect固有の機能。そちらは従来通り
+    record_batch()を使う）。
+    """
+    set_parts = [
+        "last_ingest_at_us = :now",
+        "last_batch_key = :key",
+    ]
+    values = {
+        ":now": _dec(ingest_at_us),
+        ":key": last_batch_key,
+    }
+    if fw_version:
+        set_parts.append("fw_version = :fw")
+        values[":fw"] = fw_version
+
+    prev_batch_start = int(item.get("last_batch_start_us", 0)) if item else 0
+    if batch_start_us > prev_batch_start:
+        set_parts.append("last_batch_start_us = :bs")
+        values[":bs"] = _dec(batch_start_us)
+
+    return [
+        ("SET " + ", ".join(set_parts), values),
+        ("ADD batches_total :one", {":one": Decimal(1)}),
+    ]
+
+
 def list_devices() -> list[dict]:
     """全デバイスを device_id 昇順で返す（台数は多くて数台の想定）。"""
     items = _table().scan().get("Items", [])
