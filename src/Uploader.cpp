@@ -17,29 +17,18 @@
 static constexpr uint32_t kBackoffStartMs = 1000;
 static constexpr uint32_t kBackoffMaxMs = 60000;
 
-// WiFiClientSecureの既定は120000ms。呼び出し側(uploaderTask)のtask watchdogより
-// 長いため、ネット瞬断でTLSハンドシェイクが詰まるとハンドシェイクのタイムアウト
-// より先にWDTが強制パニック再起動させてしまう（実機で確認、NamazuHaUrokoGaNai
-// docs/log/2026-08-09-device1-outage-reboot-loop-and-data-loss.md）。パニックは
-// `flushToSpill()`を経由しないためRAM上のバッチを毎回失う。詰まった時はライブラリ
-// 自身がWDTより先に諦めて接続失敗を返すようにし、既存の指数バックオフによる
-// 通常の再試行に落とす。
-//
-// 2026-08-29、device2の実クラッシュをcoredumpで確認し直した(NamazuHaUrokoGaNai
-// docs/log/2026-08-29-device2-wdt-panic-fix-direction.md)。TCP接続確立
-// (`_client->connect()`内の`select()`)・TLSハンドシェイク・レスポンスヘッダ
-// 読み取りの3区間は直列に積み上がる上、TCP接続タイムアウトの値がハンドシェイク
-// 内部のソケットrecv()/send()のSO_RCVTIMEO/SO_SNDTIMEOにもそのまま流用される
-// (arduino-esp32のssl_client.cpp)。当時の値(接続5000ms+ハンドシェイク判定4000ms
-// +ハンドシェイク内で詰まった時の重いrecv一発5000ms+ヘッダ読み取り無通信
-// ギャップ5000ms)では最悪合計が約19秒に達し、20秒WDTの余裕がほぼ無かった。
-// 3区間とも3000msへ縮め、最悪合計を12秒(3000×4。接続分がrecv/sendにも効くため
-// 実質4回分)まで切り詰め、WDTに対し8秒(40%)の余裕を持たせる。DNS解決
-// (`WiFi.hostByName()`)はこの3区間の手前で起きる別枠のブロッキングで、ここでは
-// 対処しない(上記ログ参照、既知の残課題として別途扱う)。
-static constexpr int32_t kConnectTimeoutMs = 3000;    // TCP接続 + ハンドシェイク内recv/sendの上限
-static constexpr uint32_t kHandshakeTimeoutMs = 3000; // ハンドシェイク全体の経過時間の上限
-static constexpr uint16_t kResponseTimeoutMs = 3000;  // レスポンスヘッダ読み取りの無通信ギャップ上限
+// WiFiClientSecureのハンドシェイクタイムアウト既定は120000msで、呼び出し側
+// (uploaderTask)のtask watchdogより長い。ネット瞬断でTLSハンドシェイクが詰まると
+// WDTが先に強制パニック再起動させ、`flushToSpill()`を経由しないためRAM上の
+// バッチを毎回失う（実機で確認、NamazuHaUrokoGaNai
+// docs/log/2026-08-09-device1-outage-reboot-loop-and-data-loss.md）。
+// TCP接続・TLSハンドシェイク・レスポンスヘッダ読み取りの3区間は直列に積み上がる
+// 上、TCP接続タイムアウトの値がハンドシェイク内部のソケットrecv()/send()にも
+// 流用される(arduino-esp32のssl_client.cpp)ため、3区間それぞれに明示的な上限を
+// 持たせないと合計がWDTに迫りうる（2026-08-29、device2の実クラッシュで確認、
+// NamazuHaUrokoGaNai docs/log/2026-08-29-device2-wdt-timeout-budget-implementation.md）。
+// 具体的な値の選び方・既定値の根拠はUploader.hのコンストラクタ引数
+// (connectTimeoutMs/handshakeTimeoutMs/responseTimeoutMs)のコメント参照。
 
 // postBatch()の各段階(http_.begin()/http_.POST()前後)にタイムスタンプ付きログを
 // 出す。既定オフ(呼び出し側のbuild_flagsで-DUPLINK_DEBUG_TIMINGを渡した時だけ
@@ -85,7 +74,9 @@ Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmac
                    bool dropOldestWhenFull, const char* const* watchResponseHeaders,
                    const char* const* extraRequestHeaderNames,
                    const char* const* extraRequestHeaderValues, const char* caCert,
-                   size_t maxSpillReadBytes, bool discardSpillOn400)
+                   size_t maxSpillReadBytes, bool discardSpillOn400,
+                   int32_t connectTimeoutMs, uint32_t handshakeTimeoutMs,
+                   uint16_t responseTimeoutMs)
     : ingestUrl_(ingestUrl), alertUrl_(alertUrl), hmacSecret_(hmacSecret),
       deviceId_(deviceId), maxRam_(maxRamBatches), spillDir_(spillDir),
       dropOldestWhenFull_(dropOldestWhenFull), watchResponseHeaders_(watchResponseHeaders),
@@ -95,7 +86,8 @@ Uploader::Uploader(const char* ingestUrl, const char* alertUrl, const char* hmac
       extraRequestHeaderCount_(countSentinelArray(extraRequestHeaderNames)),
       caCert_(caCert), discardSpillOn400_(discardSpillOn400),
       lastResponseHeaderValues_(watchResponseHeaderCount_),
-      maxSpillReadBytes_(maxSpillReadBytes) {}
+      maxSpillReadBytes_(maxSpillReadBytes), connectTimeoutMs_(connectTimeoutMs),
+      handshakeTimeoutMs_(handshakeTimeoutMs), responseTimeoutMs_(responseTimeoutMs) {}
 
 Uploader::~Uploader() {
   free(spillReadBuf_);
@@ -108,9 +100,9 @@ bool Uploader::begin() {
   } else {
     client_.setInsecure();  // caCert未指定時の後方互換フォールバック（検証なし）
   }
-  client_.setHandshakeTimeout(kHandshakeTimeoutMs);
-  http_.setConnectTimeout(kConnectTimeoutMs);
-  http_.setTimeout(kResponseTimeoutMs);
+  client_.setHandshakeTimeout(handshakeTimeoutMs_);
+  http_.setConnectTimeout(connectTimeoutMs_);
+  http_.setTimeout(responseTimeoutMs_);
   if (!LittleFS.begin(true)) {
     Serial.println("[uploader] LittleFS mount failed");
     return false;
@@ -440,10 +432,10 @@ bool Uploader::sendAlert(const char* json, size_t len) {
   } else {
     client.setInsecure();  // caCert未指定時の後方互換フォールバック（検証なし）
   }
-  client.setHandshakeTimeout(kHandshakeTimeoutMs);
+  client.setHandshakeTimeout(handshakeTimeoutMs_);
   HTTPClient http;
-  http.setConnectTimeout(kConnectTimeoutMs);
-  http.setTimeout(kResponseTimeoutMs);
+  http.setConnectTimeout(connectTimeoutMs_);
+  http.setTimeout(responseTimeoutMs_);
   if (!http.begin(client, alertUrl_)) return false;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Namz-Device", String(deviceId_));

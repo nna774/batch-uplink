@@ -83,6 +83,21 @@ class Uploader {
   // 都度malloc/free経路へ安全に縮退する。
   //
   // discardSpillOn400: ファイル冒頭の「不変条件」例外2を参照。既定false。
+  //
+  // connectTimeoutMs/handshakeTimeoutMs/responseTimeoutMs: postBatch()/sendAlert()の
+  // TCP接続確立・TLSハンドシェイク・レスポンスヘッダ読み取りの上限（それぞれ
+  // ミリ秒）。既定は3000/3000/3000——呼び出し側のtask watchdogが20秒
+  // (`esp_task_wdt_add()`)の環境で、最悪合計12秒（接続タイムアウトの値はハンド
+  // シェイク内部のソケットrecv()/send()にも流用されるため、実質「接続1回＋
+  // ハンドシェイク判定＋ハンドシェイク内recv一発＋ヘッダ読み取り」の4区間分）に
+  // 収まるよう決めた値（NamazuHaUrokoGaNai
+  // docs/log/2026-08-29-device2-wdt-timeout-budget-implementation.md）。
+  // `Uploader`はこのレポ専用ではなく周波数モニタElectabuzzとも共有しており、
+  // 呼び出し側のWDT設定（ひいては安全な合計値）はプロジェクトごとに異なりうる
+  // ため引数化した。値を選ぶ時は「3区間の合計＋呼び出し側の他の処理時間」が
+  // 自分のtask watchdogの上限を確実に下回るようにすること（DNS解決
+  // (`WiFi.hostByName()`)はこの3区間の外側で起きる別枠のブロッキングで、
+  // ここでは考慮していない——lwIP既定値に丸投げで別途の対策が要る）。
   Uploader(const char* ingestUrl, const char* alertUrl, const char* hmacSecret,
            uint32_t deviceId, uint32_t maxRamBatches, const char* spillDir,
            bool dropOldestWhenFull = false,
@@ -90,7 +105,8 @@ class Uploader {
            const char* const* extraRequestHeaderNames = nullptr,
            const char* const* extraRequestHeaderValues = nullptr,
            const char* caCert = nullptr, size_t maxSpillReadBytes = 0,
-           bool discardSpillOn400 = false);
+           bool discardSpillOn400 = false, int32_t connectTimeoutMs = 3000,
+           uint32_t handshakeTimeoutMs = 3000, uint16_t responseTimeoutMs = 3000);
 
   ~Uploader();
 
@@ -196,6 +212,12 @@ class Uploader {
   // 都度malloc/free経路を使う）。
   size_t maxSpillReadBytes_ = 0;
   uint8_t* spillReadBuf_ = nullptr;
+
+  // postBatch()/sendAlert()のTCP接続・TLSハンドシェイク・レスポンスヘッダ読み取り
+  // それぞれの上限（コンストラクタ引数参照）。
+  int32_t connectTimeoutMs_;
+  uint32_t handshakeTimeoutMs_;
+  uint16_t responseTimeoutMs_;
 
   // ingest向けのTCP/TLS接続をpostBatch()呼び出しをまたいで使い回す
   // （バックフィルで連続POSTする時のTLSハンドシェイク連発を避けるため）。
