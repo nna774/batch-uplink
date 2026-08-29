@@ -17,20 +17,29 @@
 static constexpr uint32_t kBackoffStartMs = 1000;
 static constexpr uint32_t kBackoffMaxMs = 60000;
 
-// WiFiClientSecureの既定は120000ms。呼び出し側(uploaderTask)の10秒task
-// watchdogより長いため、ネット瞬断でTLSハンドシェイクが詰まるとハンドシェイクの
-// タイムアウトより先にWDTが強制パニック再起動させてしまう（実機で確認、
-// NamazuHaUrokoGaNai docs/log/2026-08-09-device1-outage-reboot-loop-and-data-loss.md）。
-// パニックは`flushToSpill()`を経由しないためRAM上のバッチを毎回失う。ここを
-// WDTの10秒未満に縮め、詰まった時はライブラリ自身が先に諦めて接続失敗を返す
-// ようにし、既存の指数バックオフによる通常の再試行に落とす。
+// WiFiClientSecureの既定は120000ms。呼び出し側(uploaderTask)のtask watchdogより
+// 長いため、ネット瞬断でTLSハンドシェイクが詰まるとハンドシェイクのタイムアウト
+// より先にWDTが強制パニック再起動させてしまう（実機で確認、NamazuHaUrokoGaNai
+// docs/log/2026-08-09-device1-outage-reboot-loop-and-data-loss.md）。パニックは
+// `flushToSpill()`を経由しないためRAM上のバッチを毎回失う。詰まった時はライブラリ
+// 自身がWDTより先に諦めて接続失敗を返すようにし、既存の指数バックオフによる
+// 通常の再試行に落とす。
 //
-// HTTPClientの`_connectTimeout`/`_tcpTimeout`は既定5000ms
-// (`HTTPCLIENT_DEFAULT_TCP_TIMEOUT`、TCP接続確立と送受信を別々にカバー)なので
-// 既に10秒未満で安全。唯一守られていないのがこのハンドシェイクタイムアウトだった。
-// 「TCP接続に近い5秒＋ハンドシェイクここ」が直列に積み上がっても10秒に収まるよう、
-// design.mdの当初案(8000ms)よりさらに切り詰めて4000msにする。
-static constexpr uint32_t kHandshakeTimeoutMs = 4000;
+// 2026-08-29、device2の実クラッシュをcoredumpで確認し直した(NamazuHaUrokoGaNai
+// docs/log/2026-08-29-device2-wdt-panic-fix-direction.md)。TCP接続確立
+// (`_client->connect()`内の`select()`)・TLSハンドシェイク・レスポンスヘッダ
+// 読み取りの3区間は直列に積み上がる上、TCP接続タイムアウトの値がハンドシェイク
+// 内部のソケットrecv()/send()のSO_RCVTIMEO/SO_SNDTIMEOにもそのまま流用される
+// (arduino-esp32のssl_client.cpp)。当時の値(接続5000ms+ハンドシェイク判定4000ms
+// +ハンドシェイク内で詰まった時の重いrecv一発5000ms+ヘッダ読み取り無通信
+// ギャップ5000ms)では最悪合計が約19秒に達し、20秒WDTの余裕がほぼ無かった。
+// 3区間とも3000msへ縮め、最悪合計を12秒(3000×4。接続分がrecv/sendにも効くため
+// 実質4回分)まで切り詰め、WDTに対し8秒(40%)の余裕を持たせる。DNS解決
+// (`WiFi.hostByName()`)はこの3区間の手前で起きる別枠のブロッキングで、ここでは
+// 対処しない(上記ログ参照、既知の残課題として別途扱う)。
+static constexpr int32_t kConnectTimeoutMs = 3000;    // TCP接続 + ハンドシェイク内recv/sendの上限
+static constexpr uint32_t kHandshakeTimeoutMs = 3000; // ハンドシェイク全体の経過時間の上限
+static constexpr uint16_t kResponseTimeoutMs = 3000;  // レスポンスヘッダ読み取りの無通信ギャップ上限
 
 // postBatch()の各段階(http_.begin()/http_.POST()前後)にタイムスタンプ付きログを
 // 出す。既定オフ(呼び出し側のbuild_flagsで-DUPLINK_DEBUG_TIMINGを渡した時だけ
@@ -100,6 +109,8 @@ bool Uploader::begin() {
     client_.setInsecure();  // caCert未指定時の後方互換フォールバック（検証なし）
   }
   client_.setHandshakeTimeout(kHandshakeTimeoutMs);
+  http_.setConnectTimeout(kConnectTimeoutMs);
+  http_.setTimeout(kResponseTimeoutMs);
   if (!LittleFS.begin(true)) {
     Serial.println("[uploader] LittleFS mount failed");
     return false;
@@ -431,6 +442,8 @@ bool Uploader::sendAlert(const char* json, size_t len) {
   }
   client.setHandshakeTimeout(kHandshakeTimeoutMs);
   HTTPClient http;
+  http.setConnectTimeout(kConnectTimeoutMs);
+  http.setTimeout(kResponseTimeoutMs);
   if (!http.begin(client, alertUrl_)) return false;
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Namz-Device", String(deviceId_));
