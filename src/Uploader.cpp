@@ -117,12 +117,11 @@ bool Uploader::begin() {
     return false;
   }
   if (!LittleFS.exists(spillDir_)) LittleFS.mkdir(spillDir_);
-  // 起動時に退避ファイル数を数える。File::openNextFile()はArduino-ESP32のFS
-  // 実装内部でエントリごとにstd::make_shared<VFSFileImpl>を確保するため、
-  // 退避ファイルが大量に溜まった状態で使うと繰り返しのヒープ確保・解放で
-  // 一般ヒープを激しく断片化させる(実機で確認: NamazuHaUrokoGaNai
-  // docs/log/2026-09-01-pioarduino-arduino3-poc.md)。ファイル名だけが要る
-  // ここではPOSIXのopendir/readdirを使い、その重いオブジェクト確保を避ける。
+  // 起動時に退避ファイル数を数える。ファイル名だけが要るのでArduino-ESP32の
+  // File抽象（エントリごとにstd::make_shared<VFSFileImpl>を確保する）は使わず、
+  // ヒープを消費しないPOSIXのopendir/readdirで数える。退避ファイルが多い状態
+  // でここのヒープ確保を繰り返すと一般ヒープを激しく断片化させるため
+  // (NamazuHaUrokoGaNai docs/log/2026-09-01-pioarduino-arduino3-poc.md)。
   spillCount_ = 0;
   {
     char dirPath[80];
@@ -538,19 +537,13 @@ bool Uploader::oldestQueuedStartUs(uint64_t& outStartUs) const {
 }
 
 bool Uploader::loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs) const {
-  // 以前はFile::openNextFile()で全件を舐めて文字列比較の最小値(=最古のファイル名、
-  // タイムスタンプが接頭辞なので辞書順=時刻順)を探していたが、openNextFile()は
-  // Arduino-ESP32のFS実装内部でエントリごとにstd::make_shared<VFSFileImpl>を
-  // 確保するため、退避ファイルが多い状態でpumpサイクルのたび呼ぶと一般ヒープを
-  // 激しく断片化させる(実機で確認: NamazuHaUrokoGaNai
-  // docs/log/2026-09-01-pioarduino-arduino3-poc.md)。
-  //
-  // この関数が実際に保証すべきなのは「厳密な最古優先」ではなく「新しいデータの
-  // 流入で古いバックログが飢餓しないこと」(呼ぶたびに成功したエントリを消費して
+  // この関数が保証するのは「厳密な最古優先」ではなく「新しいデータの流入で
+  // 古いバックログが飢餓しないこと」だけ(呼ぶたびに成功したエントリを消費して
   // いく限り、ディレクトリの現在の中身はいずれ全件処理される)。そのため比較・
-  // ソートはやめ、POSIXのopendir/readdirが返す最初の非ディレクトリエントリを
-  // そのまま使う——ディレクトリ全体を舐める必要も無く、ヒープの重いオブジェクト
-  // 確保も発生しない。
+  // ソートはせず、POSIXのopendir/readdirが返す最初の非ディレクトリエントリを
+  // そのまま使う——ディレクトリ全体を舐める必要が無く、ファイルオブジェクトの
+  // ヒープ確保も発生しない
+  // (NamazuHaUrokoGaNai docs/log/2026-09-01-pioarduino-arduino3-poc.md)。
   char dirPath[80];
   snprintf(dirPath, sizeof(dirPath), "%s%s", kLittleFsBasePath, spillDir_);
   DIR* dir = opendir(dirPath);
