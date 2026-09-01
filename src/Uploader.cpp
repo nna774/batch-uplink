@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 
 #include <esp_heap_caps.h>
