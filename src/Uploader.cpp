@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
+#include <dirent.h>
 #include <esp_heap_caps.h>
 
 #include <cstdio>
@@ -14,6 +15,13 @@
 #include "HmacSha256.h"
 
 #include "esp_timer.h"
+
+namespace {
+// LittleFS.begin()は本コードベースで常にbasePath未指定(既定"/littlefs")で
+// 呼ばれている。POSIXのopendir/readdirはArduinoのFile抽象より軽く(下記参照)、
+// VFSマウントパスを含むフルパスが要る。
+constexpr const char* kLittleFsBasePath = "/littlefs";
+}  // namespace
 
 static constexpr uint32_t kBackoffStartMs = 1000;
 static constexpr uint32_t kBackoffMaxMs = 60000;
@@ -109,11 +117,24 @@ bool Uploader::begin() {
     return false;
   }
   if (!LittleFS.exists(spillDir_)) LittleFS.mkdir(spillDir_);
-  // 起動時に退避ファイル数を数える
-  File dir = LittleFS.open(spillDir_);
+  // 起動時に退避ファイル数を数える。File::openNextFile()はArduino-ESP32のFS
+  // 実装内部でエントリごとにstd::make_shared<VFSFileImpl>を確保するため、
+  // 退避ファイルが大量に溜まった状態で使うと繰り返しのヒープ確保・解放で
+  // 一般ヒープを激しく断片化させる(実機で確認: NamazuHaUrokoGaNai
+  // docs/log/2026-09-01-pioarduino-arduino3-poc.md)。ファイル名だけが要る
+  // ここではPOSIXのopendir/readdirを使い、その重いオブジェクト確保を避ける。
   spillCount_ = 0;
-  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-    if (!f.isDirectory()) ++spillCount_;
+  {
+    char dirPath[80];
+    snprintf(dirPath, sizeof(dirPath), "%s%s", kLittleFsBasePath, spillDir_);
+    DIR* dir = opendir(dirPath);
+    if (dir) {
+      struct dirent* entry;
+      while ((entry = readdir(dir)) != nullptr) {
+        if (entry->d_type != DT_DIR) ++spillCount_;
+      }
+      closedir(dir);
+    }
   }
   Serial.printf("[uploader] spill files on boot: %u\n", (unsigned)spillCount_);
   if (maxSpillReadBytes_ > 0) {
@@ -517,27 +538,34 @@ bool Uploader::oldestQueuedStartUs(uint64_t& outStartUs) const {
 }
 
 bool Uploader::loadOldestSpillPath(char* out, size_t outLen, uint64_t& startUs) const {
-  // LittleFS.open()/File::openNextFile()はどちらもArduino-ESP32のFS実装内部で
-  // std::make_shared<VFSFileImpl>を使う。ヒープ逼迫時にそのnew()が失敗すると
-  // 未捕捉例外->abort()で機体ごと再起動する（pump()側の同種コメント参照、
-  // 実機で確認済み）。ここは呼び出し元がpump()とoldestQueuedStartUs()の両方に
-  // またがるため、失敗を「退避ファイルが見つからなかった」扱いに落として
-  // 呼び出し元に伝える。
-  String oldest;
-  try {
-    File dir = LittleFS.open(spillDir_);
-    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-      if (f.isDirectory()) continue;
-      String name = f.name();
-      if (oldest.isEmpty() || name < oldest) oldest = name;
-    }
-  } catch (...) {
-    Serial.printf("[uploader] loadOldestSpillPath(%s) threw (heap exhausted?)\n", spillDir_);
-    return false;
+  // 以前はFile::openNextFile()で全件を舐めて文字列比較の最小値(=最古のファイル名、
+  // タイムスタンプが接頭辞なので辞書順=時刻順)を探していたが、openNextFile()は
+  // Arduino-ESP32のFS実装内部でエントリごとにstd::make_shared<VFSFileImpl>を
+  // 確保するため、退避ファイルが多い状態でpumpサイクルのたび呼ぶと一般ヒープを
+  // 激しく断片化させる(実機で確認: NamazuHaUrokoGaNai
+  // docs/log/2026-09-01-pioarduino-arduino3-poc.md)。
+  //
+  // この関数が実際に保証すべきなのは「厳密な最古優先」ではなく「新しいデータの
+  // 流入で古いバックログが飢餓しないこと」(呼ぶたびに成功したエントリを消費して
+  // いく限り、ディレクトリの現在の中身はいずれ全件処理される)。そのため比較・
+  // ソートはやめ、POSIXのopendir/readdirが返す最初の非ディレクトリエントリを
+  // そのまま使う——ディレクトリ全体を舐める必要も無く、ヒープの重いオブジェクト
+  // 確保も発生しない。
+  char dirPath[80];
+  snprintf(dirPath, sizeof(dirPath), "%s%s", kLittleFsBasePath, spillDir_);
+  DIR* dir = opendir(dirPath);
+  if (!dir) return false;
+  String found;
+  struct dirent* entry;
+  while ((entry = readdir(dir)) != nullptr) {
+    if (entry->d_type == DT_DIR) continue;
+    found = entry->d_name;
+    break;
   }
-  if (oldest.isEmpty()) return false;
-  snprintf(out, outLen, "%s/%s", spillDir_, oldest.c_str());
-  startUs = strtoull(oldest.c_str(), nullptr, 10);
+  closedir(dir);
+  if (found.isEmpty()) return false;
+  snprintf(out, outLen, "%s/%s", spillDir_, found.c_str());
+  startUs = strtoull(found.c_str(), nullptr, 10);
   return true;
 }
 
