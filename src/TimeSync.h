@@ -11,7 +11,8 @@ namespace timesync {
 // stepThresholdUs を超えるオフセットを検知したら slew でなく step で一発補正する。
 void begin(const char* server1, const char* server2, uint64_t stepThresholdUs);
 
-// 一度でも時刻同期できたか。
+// この起動でSNTPの応答を一度でも受け取ったか。ソフトリセットでRTCから引き継いだ
+// 時刻は、それらしい年に見えても同期済みとはみなさない。
 bool isSynced();
 
 // 現在のUNIX時刻[us]。
